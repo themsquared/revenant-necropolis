@@ -42,6 +42,18 @@ Runs at **necropolis.revenantai.dev**. The ledger lives on a persistent volume;
 without a volume **attached** at `/data`, every redeploy resets the horde to
 genesis.
 
+**Automatic (CI):** `.github/workflows/deploy.yml` runs `flyctl deploy` on every
+push to `main` (and on manual dispatch), then verifies a volume is still
+attached. One-time setup — add a scoped deploy token as a repo secret:
+
+```sh
+fly tokens create deploy -a revenant | gh secret set FLY_API_TOKEN -R themsquared/revenant-necropolis
+```
+
+Until that secret exists, the workflow skips with a notice (no red runs).
+
+**Manual:**
+
 ```sh
 fly deploy
 # then confirm exactly one necropolis_data volume shows an ATTACHED VM:

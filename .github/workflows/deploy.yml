@@ -1,0 +1,57 @@
+name: deploy
+
+# Deploy the Necropolis directory to Fly on every push to main (and on demand).
+# fly deploy updates the existing "revenant" app in place and reuses the
+# attached necropolis_data volume, so the hash-linked ledger survives — it does
+# NOT recreate the volume. (If the volume ever detaches, the horde resets to
+# genesis; see fly.toml.)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never let two deploys race the single directory machine.
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Skip gracefully (green run, clear message) until the deploy token exists.
+      - name: Preflight — is FLY_API_TOKEN set?
+        id: pre
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "::notice::FLY_API_TOKEN not set — skipping deploy."
+            echo "Add it once:  fly tokens create deploy -a revenant | gh secret set FLY_API_TOKEN -R themsquared/revenant-necropolis"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup flyctl
+        if: steps.pre.outputs.skip != 'true'
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy (remote build)
+        if: steps.pre.outputs.skip != 'true'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only
+
+      # Post-deploy guard: confirm exactly one volume is attached, so a bad
+      # deploy that dropped the mount is caught loudly instead of silently
+      # wiping the ledger on the next restart.
+      - name: Verify ledger volume is attached
+        if: steps.pre.outputs.skip != 'true'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl volumes list -a revenant || true
+          attached=$(flyctl volumes list -a revenant --json | python3 -c "import sys,json;print(sum(1 for v in json.load(sys.stdin) if v.get('attached_machine_id')))" 2>/dev/null || echo 0)
+          echo "attached volumes: $attached"
+          [ "$attached" -ge 1 ] || { echo "::error::no necropolis_data volume attached — ledger at risk"; exit 1; }
