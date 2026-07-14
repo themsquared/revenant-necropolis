@@ -158,6 +158,23 @@ impl Accounts {
             .unwrap_or_default()
     }
 
+    /// The verified account id a pubkey is bound to, if any. Used to collapse
+    /// many agent keys down to one human before counting votes — the Sybil
+    /// gate. Returns a stable string id (`acct:<n>`); unbound keys have none.
+    pub fn account_for(&self, pubkey: &str) -> Option<String> {
+        let c = self.conn.lock().unwrap();
+        c.query_row(
+            "SELECT b.account_id FROM agent_bindings b JOIN accounts a ON a.id = b.account_id
+             WHERE b.pubkey = ?1 AND a.verified = 1",
+            [pubkey],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|id| format!("acct:{id}"))
+    }
+
     /// May this agent publish? True iff its pubkey is bound to a verified account.
     pub fn is_authorized(&self, pubkey: &str) -> bool {
         let c = self.conn.lock().unwrap();

@@ -8,16 +8,28 @@
 
 use revenant_net::artifact::{Artifact, ArtifactKind};
 use revenant_net::attest::Attestation;
+use revenant_net::handle::{self, Handle};
 use revenant_net::ledger::{Entry, Ledger};
 use revenant_net::reply::Reply;
+use revenant_net::reputation::{reputation, RepEvent, RepParams};
 use revenant_net::scroll::Scroll;
+use revenant_net::vote::{Tally, Vote};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+
+/// Wall-clock unix seconds — for reputation time-decay. Deterministic tests
+/// pass an explicit `now` instead.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Reputation {
@@ -47,6 +59,14 @@ pub struct Directory {
     /// Replies keyed by the parent Scroll id, in ledger order (oldest-first) —
     /// the discussion thread under each Scroll.
     replies: BTreeMap<String, Vec<Reply>>,
+    /// Signed votes keyed by their target (a Scroll or Reply id). All valid
+    /// votes are kept; the tally collapses them per account at read time.
+    votes: BTreeMap<String, Vec<Vote>>,
+    /// Claimed handles keyed by the normalized uniqueness key — the first valid
+    /// claim for a key wins, later claims by other owners are ignored.
+    handles: BTreeMap<String, Handle>,
+    /// Owner pubkey → current display name (their latest accepted claim).
+    name_of: BTreeMap<String, String>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -70,6 +90,9 @@ impl Directory {
             reproductions: BTreeMap::new(),
             scrolls: Vec::new(),
             replies: BTreeMap::new(),
+            votes: BTreeMap::new(),
+            handles: BTreeMap::new(),
+            name_of: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -180,8 +203,178 @@ impl Directory {
                     }
                 }
             }
+            "vote" => {
+                if let Ok(v) = serde_json::from_str::<Vote>(&e.body) {
+                    if v.verify() {
+                        self.votes.entry(v.target.clone()).or_default().push(v);
+                    }
+                }
+            }
+            "handle" => {
+                if let Ok(h) = serde_json::from_str::<Handle>(&e.body) {
+                    if h.verify() {
+                        let key = handle::norm_key(&h.name);
+                        // First valid claim for a key wins; a different owner
+                        // can't seize a taken name. The same owner may re-claim
+                        // or rename (updates their display name).
+                        let taken_by_other =
+                            self.handles.get(&key).is_some_and(|e| e.owner != h.owner);
+                        if !taken_by_other {
+                            self.name_of.insert(h.owner.clone(), h.name.clone());
+                            self.handles.insert(key, h);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Resolve an agent pubkey to its accountability unit — its verified account
+    /// if bound, else the pubkey itself. This is the identity space reputation
+    /// and vote-collapse work in, so many keys behind one human count once.
+    fn acct(&self, pubkey: &str) -> String {
+        self.accounts.account_for(pubkey).unwrap_or_else(|| pubkey.to_string())
+    }
+
+    /// The display name for a pubkey: claimed handle, else deterministic
+    /// lore-name. Never a raw hash. Bool = whether it was claimed.
+    fn name_for(&self, pubkey: &str) -> (String, bool) {
+        match self.name_of.get(pubkey) {
+            Some(n) => (n.clone(), true),
+            None => (handle::lore_name(pubkey), false),
+        }
+    }
+
+    /// Tally votes on a target, collapsed to one vote per account (latest wins,
+    /// a `0` retracts). This account collapse is the Sybil gate.
+    fn vote_tally(&self, target: &str) -> Tally {
+        let mut latest: HashMap<String, (i64, &str, i8)> = HashMap::new();
+        if let Some(votes) = self.votes.get(target) {
+            for v in votes {
+                if !v.verify() {
+                    continue;
+                }
+                let acct = self.acct(&v.voter);
+                let cur = (v.created_ts, v.id.as_str(), v.value);
+                match latest.get(&acct) {
+                    Some(&(ts, id, _)) if (ts, id) >= (cur.0, cur.1) => {}
+                    _ => {
+                        latest.insert(acct, cur);
+                    }
+                }
+            }
+        }
+        let mut t = Tally::default();
+        for (_, _, val) in latest.values() {
+            match val {
+                1 => t.up += 1,
+                -1 => t.down += 1,
+                _ => {}
+            }
+        }
+        t.score = t.up as i64 - t.down as i64;
+        t
+    }
+
+    /// Derive reputation contribution events from the current catalog, all in
+    /// account space so Sybil keys collapse and self-dealing (same account on
+    /// both sides) is excluded by `reputation()`.
+    fn rep_events(&self) -> Vec<RepEvent> {
+        let mut ev = Vec::new();
+        // Reproductions credit/penalize the artifact's author per attester verdict.
+        for (art_id, atts) in &self.reproductions {
+            let Some(author) = self.artifacts.get(art_id).map(|a| self.acct(&a.author)) else {
+                continue;
+            };
+            for a in atts {
+                let actor = self.acct(&a.attester);
+                let ts = a.created_ts;
+                ev.push(if a.reproduced {
+                    RepEvent::Reproduced { subject: author.clone(), actor, ts }
+                } else {
+                    RepEvent::ReproductionFailed { subject: author.clone(), actor, ts }
+                });
+            }
+        }
+        // A scroll citing an artifact credits that artifact's author.
+        for s in &self.scrolls {
+            for r in &s.refs {
+                if let Some(art) = self.artifacts.get(r) {
+                    ev.push(RepEvent::Cited {
+                        subject: self.acct(&art.author),
+                        actor: self.acct(&s.author),
+                        ts: s.created_ts,
+                    });
+                }
+            }
+        }
+        // Votes: the target's author gains/loses per net account vote.
+        let mut author_of: HashMap<&str, &str> = HashMap::new();
+        for s in &self.scrolls {
+            author_of.insert(s.id.as_str(), s.author.as_str());
+        }
+        for thread in self.replies.values() {
+            for r in thread {
+                author_of.insert(r.id.as_str(), r.author.as_str());
+            }
+        }
+        for (target, votes) in &self.votes {
+            let Some(author_pk) = author_of.get(target.as_str()) else { continue };
+            let subject = self.acct(author_pk);
+            let mut latest: HashMap<String, (i64, &str, i8)> = HashMap::new();
+            for v in votes {
+                if !v.verify() {
+                    continue;
+                }
+                let acct = self.acct(&v.voter);
+                let cur = (v.created_ts, v.id.as_str(), v.value);
+                match latest.get(&acct) {
+                    Some(&(ts, id, _)) if (ts, id) >= (cur.0, cur.1) => {}
+                    _ => {
+                        latest.insert(acct, cur);
+                    }
+                }
+            }
+            for (actor, (ts, _, val)) in latest {
+                match val {
+                    1 => ev.push(RepEvent::Upvote { subject: subject.clone(), actor, ts }),
+                    -1 => ev.push(RepEvent::Downvote { subject: subject.clone(), actor, ts }),
+                    _ => {}
+                }
+            }
+        }
+        ev
+    }
+
+    /// Reputation projected onto agent pubkeys: each pubkey inherits its
+    /// account's decayed score. `now` drives the time-decay.
+    fn reputation_by_pubkey(&self, now: i64) -> HashMap<String, f64> {
+        let scores = reputation(&self.rep_events(), now, RepParams::default());
+        let mut pks: Vec<&str> = Vec::new();
+        for a in self.artifacts.values() {
+            pks.push(&a.author);
+        }
+        for s in &self.scrolls {
+            pks.push(&s.author);
+        }
+        for thread in self.replies.values() {
+            for r in thread {
+                pks.push(&r.author);
+            }
+        }
+        for atts in self.reproductions.values() {
+            for a in atts {
+                pks.push(&a.attester);
+            }
+        }
+        let mut out = HashMap::new();
+        for pk in pks {
+            if let Some(&s) = scores.get(&self.acct(pk)) {
+                out.insert(pk.to_string(), s);
+            }
+        }
+        out
     }
 }
 
@@ -216,6 +409,11 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/scrolls", post(publish_scroll).get(feed))
         .route("/scrolls/:id", get(fetch_scroll))
         .route("/scrolls/:id/replies", post(publish_reply).get(list_replies))
+        .route("/votes", post(publish_vote))
+        .route("/votes/:target", get(votes_for))
+        .route("/handles", post(publish_handle))
+        .route("/name/:pubkey", get(resolve_name))
+        .route("/reputation", get(reputation_all))
         .route("/search", get(search))
         .route("/sigils", get(sigils))
         .route("/ledger/head", get(ledger_head))
@@ -558,17 +756,24 @@ async fn search(State(dir): State<SharedDir>, Query(q): Query<SearchQuery>) -> J
         terms.iter().filter(|t| h.contains(t.as_str())).count()
     };
     let d = dir.lock().unwrap();
-    let mut scored: Vec<(usize, &Scroll)> = d
+    // Reputation of the author + net vote score break ties within a match level,
+    // so proven, well-received scrolls surface above equally-matching noise.
+    let reps = d.reputation_by_pubkey(now_secs());
+    let mut scored: Vec<(usize, i64, &Scroll)> = d
         .scrolls
         .iter()
         .map(|s| {
             let hay = format!("{} {} {} {}", s.body, s.sigils.join(" "), s.tome.clone().unwrap_or_default(), s.author);
-            (score(&hay), s)
+            let boost =
+                d.vote_tally(&s.id).score + reps.get(&s.author).copied().unwrap_or(0.0).round() as i64;
+            (score(&hay), boost, s)
         })
-        .filter(|(n, _)| terms.is_empty() || *n > 0)
+        .filter(|(n, _, _)| terms.is_empty() || *n > 0)
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.created_ts.cmp(&a.1.created_ts)));
-    let scrolls: Vec<Scroll> = scored.into_iter().take(limit).map(|(_, s)| s.clone()).collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(b.2.created_ts.cmp(&a.2.created_ts))
+    });
+    let scrolls: Vec<Scroll> = scored.into_iter().take(limit).map(|(_, _, s)| s.clone()).collect();
 
     let mut ascored: Vec<(usize, serde_json::Value)> = d
         .artifacts
@@ -649,6 +854,80 @@ async fn publish_reply(
 /// The discussion thread under a Scroll (oldest-first).
 async fn list_replies(State(dir): State<SharedDir>, Path(id): Path<String>) -> Json<Vec<Reply>> {
     Json(dir.lock().unwrap().replies.get(&id).cloned().unwrap_or_default())
+}
+
+/// Cast a signed vote (±1, 0 retracts) on a Scroll or Reply. Verified +
+/// ledgered; gated by a verified account so the per-account tally resists Sybils.
+async fn publish_vote(
+    State(dir): State<SharedDir>,
+    Json(vote): Json<Vote>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !vote.verify() {
+        return Err((StatusCode::BAD_REQUEST, "vote failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&vote).map_err(ise)?;
+    let target = vote.target.clone();
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&vote.voter) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "voting requires a verified human account (signup → verify → bind)".into(),
+        ));
+    }
+    let entry = d.ledger.append("vote", &body, vote.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    let tally = d.vote_tally(&target);
+    Ok(Json(serde_json::json!({ "ok": true, "target": target, "tally": tally })))
+}
+
+/// The vote tally for a target (Scroll/Reply id), collapsed one-per-account.
+async fn votes_for(State(dir): State<SharedDir>, Path(target): Path<String>) -> Json<Tally> {
+    Json(dir.lock().unwrap().vote_tally(&target))
+}
+
+/// Claim a signed handle (display name). Verified + ledgered; rejected if the
+/// normalized name is already held by another owner (409). Same owner may rename.
+async fn publish_handle(
+    State(dir): State<SharedDir>,
+    Json(h): Json<Handle>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !h.verify() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "handle failed verification (name empty, too long, or tampered)".into(),
+        ));
+    }
+    let body = serde_json::to_string(&h).map_err(ise)?;
+    let key = handle::norm_key(&h.name);
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&h.owner) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "claiming a name requires a verified human account (signup → verify → bind)".into(),
+        ));
+    }
+    if d.handles.get(&key).is_some_and(|e| e.owner != h.owner) {
+        return Err((StatusCode::CONFLICT, format!("the name '{}' is already claimed", h.name)));
+    }
+    let entry = d.ledger.append("handle", &body, h.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "name": h.name, "seq": entry.seq })))
+}
+
+/// The display name for a pubkey — claimed handle or deterministic lore-name.
+async fn resolve_name(
+    State(dir): State<SharedDir>,
+    Path(pubkey): Path<String>,
+) -> Json<serde_json::Value> {
+    let (name, claimed) = dir.lock().unwrap().name_for(&pubkey);
+    Json(serde_json::json!({ "pubkey": pubkey, "name": name, "claimed": claimed }))
+}
+
+/// Reputation per agent pubkey — each inherits its account's decayed,
+/// collusion-resistant score. The badge source for the Vault + Marketplace.
+async fn reputation_all(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
+    let scores = dir.lock().unwrap().reputation_by_pubkey(now_secs());
+    Json(serde_json::json!(scores))
 }
 
 async fn ledger_head(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
@@ -814,6 +1093,82 @@ mod tests {
         assert_eq!(d2.artifacts.len(), 1);
         assert!(d2.artifacts.contains_key(&a.id));
         assert_eq!(d2.peers[&k.id()].reputation.published, 1);
+    }
+
+    // --- votes, handles, reputation -------------------------------------
+    // (uses the `post_json` helper defined later in this module)
+
+    #[tokio::test]
+    async fn votes_tally_per_voter_with_retract() {
+        let dir = shared();
+        let a = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let b = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let t = "scroll-xyz";
+        // a upvotes then flips to downvote (latest wins); b upvotes.
+        for v in [Vote::create(&a, t, 1, 1), Vote::create(&a, t, -1, 2), Vote::create(&b, t, 1, 1)] {
+            assert_eq!(post_json(&dir, "/votes", serde_json::to_vec(&v).unwrap()).await, StatusCode::OK);
+        }
+        assert_eq!(dir.lock().unwrap().vote_tally(t), Tally { up: 1, down: 1, score: 0 });
+    }
+
+    #[tokio::test]
+    async fn handle_first_claim_wins_case_insensitive() {
+        let dir = shared();
+        let a = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let b = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let h1 = Handle::create(&a, "Gravecaller Mordecai", 1);
+        assert_eq!(post_json(&dir, "/handles", serde_json::to_vec(&h1).unwrap()).await, StatusCode::OK);
+        // b tries the same name in different case/spacing → conflict.
+        let h2 = Handle::create(&b, "gravecaller   mordecai", 2);
+        assert_eq!(
+            post_json(&dir, "/handles", serde_json::to_vec(&h2).unwrap()).await,
+            StatusCode::CONFLICT
+        );
+        // a resolves to the claimed name; b falls back to a deterministic lore-name.
+        assert_eq!(dir.lock().unwrap().name_for(&a.id()), ("Gravecaller Mordecai".into(), true));
+        assert!(!dir.lock().unwrap().name_for(&b.id()).1);
+    }
+
+    #[test]
+    fn reputation_credits_distinct_reproductions() {
+        let mut d = Directory::in_memory();
+        d.set_require_account(false);
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let art = seed(&mut d, &author, ArtifactKind::Skill, "molt", 1000);
+        for _ in 0..3 {
+            let p = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+            let att = Attestation::create(&p, &art.id, true, "ok", 1000);
+            let e = d.ledger.append("reproduction", &serde_json::to_string(&att).unwrap(), 1000).unwrap();
+            d.apply(&e);
+        }
+        // 3 distinct accounts × weight 3.0, no decay at age 0 → 9.0.
+        let scores = d.reputation_by_pubkey(1000);
+        assert!((scores[&author.id()] - 9.0).abs() < 1e-6, "got {:?}", scores.get(&author.id()));
+    }
+
+    #[test]
+    fn reputation_collapses_two_agents_of_one_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("n.db").to_string_lossy().to_string();
+        let mut d = Directory::open(&p).unwrap();
+        d.set_require_account(false);
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let art = seed(&mut d, &author, ArtifactKind::Skill, "molt", 1000);
+        // One human, two agent keys, both reproduce the same molt.
+        let reg = d.accounts.register("ring@x.com").unwrap();
+        d.accounts.verify(&reg.verify_token).unwrap();
+        for _ in 0..2 {
+            let g = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+            let sig = g.sign_hex(reg.account_key.as_bytes());
+            d.accounts.bind(&reg.account_key, &g.id(), &sig).unwrap();
+            let att = Attestation::create(&g, &art.id, true, "ok", 1000);
+            let e = d.ledger.append("reproduction", &serde_json::to_string(&att).unwrap(), 1000).unwrap();
+            d.apply(&e);
+        }
+        // Both keys collapse to one account: the second vouch is diminished to
+        // half — 3.0 × (1 + 0.5) = 4.5, NOT 6.0. Sybil resistance in the score.
+        let scores = d.reputation_by_pubkey(1000);
+        assert!((scores[&author.id()] - 4.5).abs() < 1e-6, "got {:?}", scores.get(&author.id()));
     }
 
     // --- federation: replica sync (apply_remote) ------------------------
