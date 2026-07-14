@@ -16,7 +16,7 @@ use revenant_net::reputation::{reputation, RepEvent, RepParams};
 use revenant_net::scroll::Scroll;
 use revenant_net::vote::{Tally, Vote};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -553,6 +553,8 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/account/register", post(account_register))
         .route("/account/verify", post(account_verify))
         .route("/account/bind", post(account_bind))
+        .route("/account/login", post(account_login))
+        .route("/account/session", post(account_session))
         .route("/account/agents", get(account_agents))
         // The catalog is public read — allow any origin so the static skills
         // marketplace (Netlify) can fetch it cross-origin. Authenticity is the
@@ -582,7 +584,7 @@ async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> axum
     let h = resp.headers_mut();
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
-    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type, authorization"));
     h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
     resp
 }
@@ -713,17 +715,104 @@ async fn account_bind(
 }
 
 #[derive(Deserialize)]
-struct AgentsQuery {
-    key: String,
+struct LoginReq {
+    email: String,
 }
 
-/// List the agents bound to the account holding `key` (web dashboard).
+/// Begin a magic-link login. Always 200 with the same shape whether or not the
+/// email has a verified account (no account-existence leak). In dev, or when
+/// email delivery isn't configured/fails, the one-time token is surfaced.
+async fn account_login(
+    State(dir): State<SharedDir>,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let token = { dir.lock().unwrap().accounts.request_login(&req.email).map_err(ise)? };
+    match token {
+        Some(tok) => {
+            let delivered =
+                !crate::email::dev_mode() && crate::email::send_login(&req.email, &tok).await.is_ok();
+            let mut resp = serde_json::json!({
+                "ok": true,
+                "status": if delivered { "check your email for a login token" }
+                          else { "email not delivered — use the token below" },
+            });
+            if !delivered {
+                resp["login_token"] = serde_json::json!(tok);
+            }
+            Ok(Json(resp))
+        }
+        None => Ok(Json(serde_json::json!({
+            "ok": true,
+            "status": "if that email has a verified account, a login token is on its way"
+        }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionReq {
+    token: String,
+}
+
+/// Exchange a one-time login token for a session bearer.
+async fn account_session(
+    State(dir): State<SharedDir>,
+    Json(req): Json<SessionReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match dir.lock().unwrap().accounts.redeem_login(&req.token).map_err(ise)? {
+        Some(session) => Ok(Json(serde_json::json!({ "ok": true, "session": session }))),
+        None => Err((StatusCode::BAD_REQUEST, "invalid or expired login token".into())),
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentsQuery {
+    key: Option<String>,
+}
+
+/// The caller's bound agents, enriched with profile + name + reputation. Auth is
+/// a session bearer (`Authorization: Bearer <session>`); a legacy `?key=` is
+/// still honored for the older account page but is deprecated (it puts the
+/// account key in a URL).
 async fn account_agents(
     State(dir): State<SharedDir>,
+    headers: HeaderMap,
     Query(q): Query<AgentsQuery>,
-) -> Json<serde_json::Value> {
-    let agents = dir.lock().unwrap().accounts.agents_for(&q.key);
-    Json(serde_json::json!({ "agents": agents }))
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let d = dir.lock().unwrap();
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+    let pubkeys = if let Some(session) = bearer {
+        let id = d
+            .accounts
+            .account_for_session(&session)
+            .ok_or((StatusCode::UNAUTHORIZED, "invalid or expired session".into()))?;
+        d.accounts.agents_for_id(id)
+    } else if let Some(key) = q.key.as_deref() {
+        d.accounts.agents_for(key)
+    } else {
+        return Err((StatusCode::UNAUTHORIZED, "log in first (POST /account/login)".into()));
+    };
+    let reps = d.reputation_by_pubkey(now_secs());
+    let agents: Vec<serde_json::Value> = pubkeys
+        .iter()
+        .map(|pk| {
+            let (name, claimed) = d.name_for(pk);
+            let profile = d.profiles.get(pk);
+            serde_json::json!({
+                "agent": pk,
+                "name": name,
+                "name_claimed": claimed,
+                "reputation": reps.get(pk).copied().unwrap_or(0.0),
+                "specs": profile.map(|p| &p.specs),
+                "capabilities": profile.map(|p| p.capabilities.clone()).unwrap_or_default(),
+                "last_seen": profile.map(|p| p.created_ts),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "agents": agents })))
 }
 
 #[derive(Deserialize)]
@@ -1489,6 +1578,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn magic_link_login_gates_my_agents() {
+        let dir = Arc::new(Mutex::new(Directory::in_memory())); // require_account = true
+        let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        // register → verify → bind an agent.
+        {
+            let d = dir.lock().unwrap();
+            let reg = d.accounts.register("h@x.com").unwrap();
+            d.accounts.verify(&reg.verify_token).unwrap();
+            let sig = k.sign_hex(reg.account_key.as_bytes());
+            d.accounts.bind(&reg.account_key, &k.id(), &sig).unwrap();
+        }
+        // Magic-link: request a login token, redeem it for a session.
+        let ltok = dir.lock().unwrap().accounts.request_login("h@x.com").unwrap().expect("token");
+        let session = dir.lock().unwrap().accounts.redeem_login(&ltok).unwrap().expect("session");
+        // One-time: redeeming the same login token again fails.
+        assert!(dir.lock().unwrap().accounts.redeem_login(&ltok).unwrap().is_none());
+        // The session resolves to the account, whose agent is our bound key.
+        let id = dir.lock().unwrap().accounts.account_for_session(&session).unwrap();
+        assert_eq!(dir.lock().unwrap().accounts.agents_for_id(id), vec![k.id()]);
+        // Unknown email → no token, no leak.
+        assert!(dir.lock().unwrap().accounts.request_login("nobody@x.com").unwrap().is_none());
+
+        // /account/agents: bearer → 200; missing/bad → 401.
+        let with = router(dir.clone())
+            .oneshot(
+                Request::get("/account/agents")
+                    .header("authorization", format!("Bearer {session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(with.status(), StatusCode::OK);
+        let without = router(dir.clone())
+            .oneshot(Request::get("/account/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(without.status(), StatusCode::UNAUTHORIZED);
+        let bad = router(dir.clone())
+            .oneshot(
+                Request::get("/account/agents")
+                    .header("authorization", "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
     }
 
     // --- federation: replica sync (apply_remote) ------------------------

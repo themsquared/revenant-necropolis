@@ -60,6 +60,16 @@ impl Accounts {
                 pubkey     TEXT PRIMARY KEY,
                 account_id INTEGER NOT NULL,
                 bound_ts   INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS login_tokens (
+                token      TEXT PRIMARY KEY,
+                account_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS sessions (
+                token      TEXT PRIMARY KEY,
+                account_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL
              );",
         )?;
         Ok(Accounts { conn: Mutex::new(conn) })
@@ -154,6 +164,85 @@ impl Accounts {
             Err(_) => return vec![],
         };
         stmt.query_map([id], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Begin a magic-link login: for a VERIFIED account matching `email`, mint a
+    /// one-time login token (15-minute TTL, enforced at redeem). Returns None if
+    /// the email is unknown or unverified — the caller must NOT leak which, so it
+    /// responds the same either way.
+    pub fn request_login(&self, email: &str) -> Result<Option<String>> {
+        let email = email.trim().to_lowercase();
+        let c = self.conn.lock().unwrap();
+        let id: Option<i64> = c
+            .query_row("SELECT id FROM accounts WHERE email = ?1 AND verified = 1", [&email], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(id) = id else { return Ok(None) };
+        let token = rand_hex(20);
+        c.execute(
+            "INSERT INTO login_tokens (token, account_id, created_ts) VALUES (?1, ?2, ?3)",
+            rusqlite::params![token, id, now()],
+        )?;
+        Ok(Some(token))
+    }
+
+    /// Redeem a login token for a session bearer (7-day TTL). One-time: the login
+    /// token is consumed whether or not it was still fresh. Returns None if the
+    /// token is unknown or expired.
+    pub fn redeem_login(&self, login_token: &str) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(i64, i64)> = c
+            .query_row(
+                "SELECT account_id, created_ts FROM login_tokens WHERE token = ?1",
+                [login_token],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        c.execute("DELETE FROM login_tokens WHERE token = ?1", [login_token])?; // one-time
+        let Some((account_id, created)) = row else { return Ok(None) };
+        if now() - created > 900 {
+            return Ok(None); // 15-minute login-token TTL
+        }
+        let session = rand_hex(24);
+        c.execute(
+            "INSERT INTO sessions (token, account_id, created_ts) VALUES (?1, ?2, ?3)",
+            rusqlite::params![session, account_id, now()],
+        )?;
+        Ok(Some(session))
+    }
+
+    /// Resolve a session bearer to its account id, if the session is valid and
+    /// unexpired (7-day TTL).
+    pub fn account_for_session(&self, session: &str) -> Option<i64> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(i64, i64)> = c
+            .query_row(
+                "SELECT account_id, created_ts FROM sessions WHERE token = ?1",
+                [session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (id, created) = row?;
+        if now() - created > 7 * 24 * 3600 {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// Agent pubkeys bound to an account id (the session-authenticated form of
+    /// `agents_for`, which takes the raw account key).
+    pub fn agents_for_id(&self, account_id: i64) -> Vec<String> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = match c.prepare("SELECT pubkey FROM agent_bindings WHERE account_id = ?1") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([account_id], |r| r.get::<_, String>(0))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
     }

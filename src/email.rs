@@ -39,3 +39,32 @@ pub async fn send_verification(email: &str, token: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Send a magic-link login token. Same provider seam as verification; dev mode
+/// logs it (and the login endpoint surfaces it) so the flow never dead-ends.
+pub async fn send_login(email: &str, token: &str) -> anyhow::Result<()> {
+    if dev_mode() {
+        tracing::info!("[dev email] login for {email}: token={token}");
+        return Ok(());
+    }
+    let key = std::env::var("RESEND_API_KEY").unwrap();
+    let from = std::env::var("RESEND_FROM").unwrap_or_else(|_| "Revenant <noreply@revenantai.dev>".into());
+    let body = serde_json::json!({
+        "from": from,
+        "to": [email],
+        "subject": "Your Revenant login link",
+        "text": format!(
+            "Log in to your horde.\n\nPaste this one-time token into the My Horde page (valid 15 minutes):\n\n    {token}\n\nIf you didn't request this, ignore it."
+        ),
+    });
+    let resp = reqwest::Client::new()
+        .post("https://api.resend.com/emails")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("resend send failed: {}", resp.text().await.unwrap_or_default());
+    }
+    Ok(())
+}
