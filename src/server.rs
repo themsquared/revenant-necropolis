@@ -9,6 +9,7 @@
 use revenant_net::artifact::{Artifact, ArtifactKind};
 use revenant_net::attest::Attestation;
 use revenant_net::ledger::{Entry, Ledger};
+use revenant_net::reply::Reply;
 use revenant_net::scroll::Scroll;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -43,6 +44,9 @@ pub struct Directory {
     reproductions: BTreeMap<String, Vec<Attestation>>,
     /// Vault Scrolls, in ledger (append) order; the feed serves newest-first.
     scrolls: Vec<Scroll>,
+    /// Replies keyed by the parent Scroll id, in ledger order (oldest-first) —
+    /// the discussion thread under each Scroll.
+    replies: BTreeMap<String, Vec<Reply>>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -65,6 +69,7 @@ impl Directory {
             artifacts: BTreeMap::new(),
             reproductions: BTreeMap::new(),
             scrolls: Vec::new(),
+            replies: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -167,6 +172,14 @@ impl Directory {
                     }
                 }
             }
+            "reply" => {
+                if let Ok(r) = serde_json::from_str::<Reply>(&e.body) {
+                    let thread = self.replies.entry(r.parent.clone()).or_default();
+                    if !thread.iter().any(|x| x.id == r.id) {
+                        thread.push(r);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -202,6 +215,7 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/artifacts/:id/reproductions", get(list_reproductions))
         .route("/scrolls", post(publish_scroll).get(feed))
         .route("/scrolls/:id", get(fetch_scroll))
+        .route("/scrolls/:id/replies", post(publish_reply).get(list_replies))
         .route("/ledger/head", get(ledger_head))
         .route("/ledger/since/:seq", get(ledger_since))
         .route("/account/register", post(account_register))
@@ -529,6 +543,39 @@ async fn fetch_scroll(
         .cloned()
         .map(Json)
         .ok_or((StatusCode::NOT_FOUND, "no such scroll".into()))
+}
+
+/// Post a signed reply under a Scroll — the discussion. Verified + ledgered;
+/// the path id must match the reply's declared parent.
+async fn publish_reply(
+    State(dir): State<SharedDir>,
+    Path(id): Path<String>,
+    Json(reply): Json<Reply>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if reply.parent != id {
+        return Err((StatusCode::BAD_REQUEST, "reply.parent does not match the scroll id in the path".into()));
+    }
+    if !reply.verify() {
+        return Err((StatusCode::BAD_REQUEST, "reply failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&reply).map_err(ise)?;
+    let rid = reply.id.clone();
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&reply.author) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "replying requires a verified human account (signup → verify → bind)".into(),
+        ));
+    }
+    let entry = d.ledger.append("reply", &body, reply.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    let count = d.replies.get(&id).map(|v| v.len()).unwrap_or(0);
+    Ok(Json(serde_json::json!({ "ok": true, "id": rid, "seq": entry.seq, "replies": count })))
+}
+
+/// The discussion thread under a Scroll (oldest-first).
+async fn list_replies(State(dir): State<SharedDir>, Path(id): Path<String>) -> Json<Vec<Reply>> {
+    Json(dir.lock().unwrap().replies.get(&id).cloned().unwrap_or_default())
 }
 
 async fn ledger_head(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
@@ -907,6 +954,32 @@ mod tests {
         s.body = "tampered".into();
         assert_eq!(
             post_json(&dir, "/scrolls", serde_json::to_vec(&s).unwrap()).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_is_verified_ledgered_and_threaded() {
+        let dir = shared();
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let s = Scroll::create(&author, "landed a molt", vec![], 1);
+        assert_eq!(post_json(&dir, "/scrolls", serde_json::to_vec(&s).unwrap()).await, StatusCode::OK);
+
+        let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let r = Reply::create(&peer, &s.id, "reproduced it too — solid win", 2);
+        let path = format!("/scrolls/{}/replies", s.id);
+        assert_eq!(post_json(&dir, &path, serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
+        assert_eq!(dir.lock().unwrap().replies[&s.id].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reply_rejects_parent_mismatch() {
+        let dir = shared();
+        let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let r = Reply::create(&peer, "scrollA", "hi", 1); // signed for scrollA…
+        // …but posted under scrollB in the path → rejected.
+        assert_eq!(
+            post_json(&dir, "/scrolls/scrollB/replies", serde_json::to_vec(&r).unwrap()).await,
             StatusCode::BAD_REQUEST
         );
     }
