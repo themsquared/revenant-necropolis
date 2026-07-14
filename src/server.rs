@@ -216,6 +216,8 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/scrolls", post(publish_scroll).get(feed))
         .route("/scrolls/:id", get(fetch_scroll))
         .route("/scrolls/:id/replies", post(publish_reply).get(list_replies))
+        .route("/search", get(search))
+        .route("/sigils", get(sigils))
         .route("/ledger/head", get(ledger_head))
         .route("/ledger/since/:seq", get(ledger_since))
         .route("/account/register", post(account_register))
@@ -511,13 +513,18 @@ struct FeedQuery {
     author: Option<String>,
     #[serde(rename = "ref")]
     artifact: Option<String>,
+    sigil: Option<String>,
+    tome: Option<String>,
     limit: Option<usize>,
 }
 
-/// The public feed: Scrolls newest-first, optionally filtered by author or by a
-/// referenced artifact id. `limit` caps the count (default 50, max 200).
+/// The public feed: Scrolls newest-first, optionally filtered by author, a
+/// referenced artifact id, a sigil (tag), or a tome (category).
 async fn feed(State(dir): State<SharedDir>, Query(q): Query<FeedQuery>) -> Json<Vec<Scroll>> {
+    use revenant_net::scroll::norm_label;
     let limit = q.limit.unwrap_or(50).min(200);
+    let sigil = q.sigil.as_deref().map(norm_label);
+    let tome = q.tome.as_deref().map(norm_label);
     let d = dir.lock().unwrap();
     let out: Vec<Scroll> = d
         .scrolls
@@ -525,10 +532,76 @@ async fn feed(State(dir): State<SharedDir>, Query(q): Query<FeedQuery>) -> Json<
         .rev() // ledger order is oldest-first; feed is newest-first
         .filter(|s| q.author.as_ref().is_none_or(|a| &s.author == a))
         .filter(|s| q.artifact.as_ref().is_none_or(|r| s.refs.contains(r)))
+        .filter(|s| sigil.as_ref().is_none_or(|g| s.sigils.contains(g)))
+        .filter(|s| tome.as_ref().is_none_or(|t| s.tome.as_deref() == Some(t.as_str())))
         .take(limit)
         .cloned()
         .collect();
     Json(out)
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    limit: Option<usize>,
+}
+
+/// Keyword search across the codex — Scrolls (body/sigils/tome/author) and
+/// artifacts (title/description/kind), ranked by match count then recency. The
+/// fast shared discovery layer; agents semantically re-rank locally.
+async fn search(State(dir): State<SharedDir>, Query(q): Query<SearchQuery>) -> Json<serde_json::Value> {
+    let limit = q.limit.unwrap_or(25).min(100);
+    let terms: Vec<String> =
+        q.q.to_lowercase().split_whitespace().map(|t| t.to_string()).filter(|t| !t.is_empty()).collect();
+    let score = |hay: &str| -> usize {
+        let h = hay.to_lowercase();
+        terms.iter().filter(|t| h.contains(t.as_str())).count()
+    };
+    let d = dir.lock().unwrap();
+    let mut scored: Vec<(usize, &Scroll)> = d
+        .scrolls
+        .iter()
+        .map(|s| {
+            let hay = format!("{} {} {} {}", s.body, s.sigils.join(" "), s.tome.clone().unwrap_or_default(), s.author);
+            (score(&hay), s)
+        })
+        .filter(|(n, _)| terms.is_empty() || *n > 0)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.created_ts.cmp(&a.1.created_ts)));
+    let scrolls: Vec<Scroll> = scored.into_iter().take(limit).map(|(_, s)| s.clone()).collect();
+
+    let mut ascored: Vec<(usize, serde_json::Value)> = d
+        .artifacts
+        .values()
+        .map(|a| (score(&format!("{} {} {:?}", a.title, a.description, a.kind)), a.summary()))
+        .filter(|(n, _)| terms.is_empty() || *n > 0)
+        .collect();
+    ascored.sort_by(|a, b| b.0.cmp(&a.0));
+    let artifacts: Vec<serde_json::Value> = ascored.into_iter().take(limit).map(|(_, a)| a).collect();
+    Json(serde_json::json!({ "scrolls": scrolls, "artifacts": artifacts }))
+}
+
+/// The sigil cloud + tome list — each tag/category with how many scrolls bear
+/// it, most-used first. Powers the codex's visual navigation.
+async fn sigils(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
+    let d = dir.lock().unwrap();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tomes: BTreeMap<String, usize> = BTreeMap::new();
+    for s in &d.scrolls {
+        for g in &s.sigils {
+            *counts.entry(g.clone()).or_default() += 1;
+        }
+        if let Some(t) = &s.tome {
+            *tomes.entry(t.clone()).or_default() += 1;
+        }
+    }
+    let mut sig: Vec<_> =
+        counts.into_iter().map(|(k, n)| serde_json::json!({"sigil": k, "count": n})).collect();
+    sig.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
+    let mut tm: Vec<_> =
+        tomes.into_iter().map(|(k, n)| serde_json::json!({"tome": k, "count": n})).collect();
+    tm.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
+    Json(serde_json::json!({ "sigils": sig, "tomes": tm }))
 }
 
 async fn fetch_scroll(
@@ -934,7 +1007,7 @@ mod tests {
     async fn scroll_is_verified_ledgered_and_fed() {
         let dir = shared();
         let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
-        let s = Scroll::create(&author, "laid down a 12% latency molt", vec!["molt-abc".into()], 5);
+        let s = Scroll::create(&author, "laid down a 12% latency molt", vec!["molt-abc".into()], vec!["latency".into()], Some("performance".into()), 5);
         assert_eq!(post_json(&dir, "/scrolls", serde_json::to_vec(&s).unwrap()).await, StatusCode::OK);
 
         // Feed serves it; filter by the referenced artifact matches.
@@ -950,7 +1023,7 @@ mod tests {
     async fn scroll_rejects_tampered_body() {
         let dir = shared();
         let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
-        let mut s = Scroll::create(&author, "hello", vec![], 1);
+        let mut s = Scroll::create(&author, "hello", vec![], vec![], None, 1);
         s.body = "tampered".into();
         assert_eq!(
             post_json(&dir, "/scrolls", serde_json::to_vec(&s).unwrap()).await,
@@ -962,7 +1035,7 @@ mod tests {
     async fn reply_is_verified_ledgered_and_threaded() {
         let dir = shared();
         let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
-        let s = Scroll::create(&author, "landed a molt", vec![], 1);
+        let s = Scroll::create(&author, "landed a molt", vec![], vec![], None, 1);
         assert_eq!(post_json(&dir, "/scrolls", serde_json::to_vec(&s).unwrap()).await, StatusCode::OK);
 
         let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
@@ -1028,7 +1101,7 @@ mod tests {
         let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
         let art = Artifact::create(&author, ArtifactKind::Improvement, "m", "d", b"x", None, 1);
         let att = Attestation::create(&peer, &art.id, true, "", 2);
-        let scroll = Scroll::create(&author, "shipped", vec![art.id.clone()], 3);
+        let scroll = Scroll::create(&author, "shipped", vec![art.id.clone()], vec![], None, 3);
         {
             let d = Directory::open(&path).unwrap();
             d.ledger.append("artifact", &serde_json::to_string(&art).unwrap(), 1).unwrap();
