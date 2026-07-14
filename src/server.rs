@@ -11,7 +11,7 @@ use revenant_net::attest::Attestation;
 use revenant_net::handle::{self, Handle};
 use revenant_net::ledger::{Entry, Ledger};
 use revenant_net::profile::AgentProfile;
-use revenant_net::quest::{Quest, TaskClaim, TaskResult};
+use revenant_net::quest::{Quest, TaskAccept, TaskClaim, TaskResult};
 use revenant_net::reply::Reply;
 use revenant_net::reputation::{reputation, RepEvent, RepParams};
 use revenant_net::scroll::Scroll;
@@ -40,6 +40,11 @@ const THREAD_E_MIN: f64 = 0.05;
 /// A task claim's lease — how long a claim holds a task before it lapses and the
 /// task re-opens for another worker. Generous enough for real work.
 const CLAIM_LEASE_SECS: i64 = 1800; // 30 minutes
+
+/// Starting balance of closed-loop network credits granted to every verified
+/// account (once) — the faucet that bootstraps the reciprocity economy. Real
+/// spending power is earned by solving; the faucet only seeds first moves.
+const FAUCET: i64 = 100;
 
 /// Wall-clock unix seconds — for reputation time-decay. Deterministic tests
 /// pass an explicit `now` instead.
@@ -95,6 +100,9 @@ pub struct Directory {
     claims: BTreeMap<(String, String), Vec<TaskClaim>>,
     /// Signed results keyed by (quest_id, task_id).
     results: BTreeMap<(String, String), Vec<TaskResult>>,
+    /// The quest author's acceptance per task (quest_id, task_id) → the payout
+    /// trigger. Only the quest author's acceptance is stored.
+    accepts: BTreeMap<(String, String), TaskAccept>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -125,6 +133,7 @@ impl Directory {
             quests: BTreeMap::new(),
             claims: BTreeMap::new(),
             results: BTreeMap::new(),
+            accepts: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -271,6 +280,17 @@ impl Directory {
                         if !list.iter().any(|x| x.id == r.id) {
                             list.push(r);
                         }
+                    }
+                }
+            }
+            "accept" => {
+                if let Ok(a) = serde_json::from_str::<TaskAccept>(&e.body) {
+                    // Only the quest AUTHOR's signed acceptance counts — a forged
+                    // accept from anyone else is ignored even on replay.
+                    let by_author =
+                        self.quests.get(&a.quest).is_some_and(|q| q.author == a.author);
+                    if a.verify() && by_author {
+                        self.accepts.insert((a.quest.clone(), a.task.clone()), a);
                     }
                 }
             }
@@ -597,9 +617,83 @@ impl Directory {
         let (name, _) = self.name_for(&q.author);
         Some(serde_json::json!({
             "id": q.id, "author": q.author, "author_name": name, "title": q.title,
-            "spec": q.spec, "sigils": q.sigils, "deadline_ts": q.deadline_ts,
+            "spec": q.spec, "sigils": q.sigils, "bounty": q.bounty,
+            "per_task": self.per_task(q), "deadline_ts": q.deadline_ts,
             "created_ts": q.created_ts, "tasks": tasks,
         }))
+    }
+
+    /// The per-task share of a quest's bounty (integer; any remainder dust stays
+    /// with the author).
+    fn per_task(&self, q: &Quest) -> u64 {
+        if q.tasks.is_empty() {
+            0
+        } else {
+            q.bounty / q.tasks.len() as u64
+        }
+    }
+
+    /// The credit balances, replayed from the ledger, in account space. The
+    /// model is a closed transfer system seeded by the faucet:
+    ///   * an accepted task transfers its share from the author to the solver;
+    ///   * an unaccepted task on a still-live quest keeps that share ESCROWED
+    ///     (locked out of the author's available balance);
+    ///   * an unaccepted task past the deadline is refunded (never deducted).
+    /// No credits are ever minted except the one-time per-account faucet, so a
+    /// colluding ring can shuffle but never conjure balance.
+    fn credits(&self, now: i64) -> HashMap<String, i64> {
+        let mut bal: HashMap<String, i64> = HashMap::new();
+        for q in self.quests.values() {
+            let author = self.acct(&q.author);
+            bal.entry(author.clone()).or_insert(FAUCET);
+            let per = self.per_task(q) as i64;
+            if per == 0 {
+                continue;
+            }
+            for t in &q.tasks {
+                let key = (q.id.clone(), t.id.clone());
+                match self.accepts.get(&key) {
+                    Some(acc) => {
+                        // Transfer to the accepted result's worker.
+                        if let Some(res) = self
+                            .results
+                            .get(&key)
+                            .and_then(|rs| rs.iter().find(|r| r.id == acc.result_id))
+                        {
+                            let worker = self.acct(&res.worker);
+                            *bal.entry(author.clone()).or_insert(FAUCET) -= per;
+                            *bal.entry(worker).or_insert(FAUCET) += per;
+                        }
+                    }
+                    None => {
+                        let live = q.deadline_ts == 0 || q.deadline_ts > now;
+                        if live {
+                            *bal.entry(author.clone()).or_insert(FAUCET) -= per; // escrow-locked
+                        } // expired + unaccepted → refunded (no deduction)
+                    }
+                }
+            }
+        }
+        bal
+    }
+
+    /// Credits projected onto agent pubkeys (each inherits its account balance).
+    fn credits_by_pubkey(&self, now: i64) -> HashMap<String, i64> {
+        let bal = self.credits(now);
+        let mut pks: Vec<&str> = Vec::new();
+        for q in self.quests.values() {
+            pks.push(&q.author);
+        }
+        for rs in self.results.values() {
+            for r in rs {
+                pks.push(&r.worker);
+            }
+        }
+        let mut out = HashMap::new();
+        for pk in pks {
+            out.insert(pk.to_string(), bal.get(&self.acct(pk)).copied().unwrap_or(FAUCET));
+        }
+        out
     }
 }
 
@@ -647,6 +741,8 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/quests/:id", get(quest_detail))
         .route("/claims", post(publish_claim))
         .route("/results", post(publish_result))
+        .route("/accept", post(publish_accept))
+        .route("/credits", get(credits))
         .route("/search", get(search))
         .route("/sigils", get(sigils))
         .route("/ledger/head", get(ledger_head))
@@ -1366,9 +1462,59 @@ async fn publish_quest(
     if d.require_account && !d.accounts.is_authorized(&q.author) {
         return Err((StatusCode::FORBIDDEN, "posting a quest requires a verified human account".into()));
     }
+    // Escrow: the author must be able to cover the bounty they're staking.
+    let required = d.per_task(&q) as i64 * q.tasks.len() as i64;
+    if required > 0 {
+        let acct = d.acct(&q.author);
+        let available = d.credits(now_secs()).get(&acct).copied().unwrap_or(FAUCET);
+        if available < required {
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                format!("insufficient credits to stake this bounty (have {available}, need {required})"),
+            ));
+        }
+    }
     let entry = d.ledger.append("quest", &body, q.created_ts).map_err(ise)?;
     d.apply(&entry);
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "seq": entry.seq })))
+}
+
+/// The quest author accepts a result — the payout: that task's share transfers
+/// from the author's escrow to the solver. Only the quest's author may accept,
+/// and only a result that actually exists.
+async fn publish_accept(
+    State(dir): State<SharedDir>,
+    Json(acc): Json<TaskAccept>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !acc.verify() {
+        return Err((StatusCode::BAD_REQUEST, "accept failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&acc).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    {
+        let q = d.quests.get(&acc.quest).ok_or((StatusCode::NOT_FOUND, "no such quest".to_string()))?;
+        if q.author != acc.author {
+            return Err((StatusCode::FORBIDDEN, "only the quest's author may accept a result".into()));
+        }
+        if !q.tasks.iter().any(|t| t.id == acc.task) {
+            return Err((StatusCode::NOT_FOUND, "no such task in that quest".into()));
+        }
+    }
+    let result_exists = d
+        .results
+        .get(&(acc.quest.clone(), acc.task.clone()))
+        .is_some_and(|rs| rs.iter().any(|r| r.id == acc.result_id));
+    if !result_exists {
+        return Err((StatusCode::NOT_FOUND, "no such result for that task".into()));
+    }
+    let entry = d.ledger.append("accept", &body, acc.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "quest": acc.quest, "task": acc.task })))
+}
+
+/// Credit balances per agent pubkey (each inherits its account's balance).
+async fn credits(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
+    Json(serde_json::json!(dir.lock().unwrap().credits_by_pubkey(now_secs())))
 }
 
 #[derive(Deserialize)]
@@ -1857,7 +2003,7 @@ mod tests {
         let mk = || Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
         let (author, w1, w2) = (mk(), mk(), mk());
         let tasks = vec![Task { id: "t0".into(), spec: "do it".into(), verify: String::new() }];
-        let q = Quest::create(&author, "solve", "spec", tasks, vec!["compute".into()], 0, 1);
+        let q = Quest::create(&author, "solve", "spec", tasks, vec!["compute".into()], 0, 0, 1);
         assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
 
         // Claims must be stamped ~now so the lease is live.
@@ -1878,7 +2024,58 @@ mod tests {
         let state = d.quest_state(&q.id, now).unwrap();
         assert_eq!(state["tasks"][0]["status"], serde_json::json!("solved"));
         assert_eq!(d.open_task_count(&q, now), 0);
-        // A claim on a nonexistent task is rejected.
+    }
+
+    #[tokio::test]
+    async fn quest_bounty_escrows_and_pays_on_accept() {
+        use revenant_net::quest::{Quest, Task, TaskAccept, TaskResult};
+        let dir = shared();
+        let mk = || Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (author, worker) = (mk(), mk());
+        let aa = { dir.lock().unwrap().acct(&author.id()) };
+        let wa = { dir.lock().unwrap().acct(&worker.id()) };
+
+        // A quest staking a 40-credit bounty over 2 tasks (20 each).
+        let tasks = vec![
+            Task { id: "t0".into(), spec: "a".into(), verify: String::new() },
+            Task { id: "t1".into(), spec: "b".into(), verify: String::new() },
+        ];
+        let q = Quest::create(&author, "solve", "spec", tasks, vec![], 40, 0, 1);
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
+
+        // Escrow locked the full 40 out of the author's faucet.
+        {
+            let d = dir.lock().unwrap();
+            let bal = d.credits(now_secs());
+            assert_eq!(bal[&aa], FAUCET - 40);
+            assert_eq!(*bal.get(&wa).unwrap_or(&FAUCET), FAUCET); // worker untouched
+        }
+
+        // Worker solves t0; author accepts → 20 transfers.
+        let r = TaskResult::create(&worker, &q.id, "t0", "answer", 2);
+        assert_eq!(post_json(&dir, "/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
+        let acc = TaskAccept::create(&author, &q.id, "t0", &r.id, 3);
+        assert_eq!(post_json(&dir, "/accept", serde_json::to_vec(&acc).unwrap()).await, StatusCode::OK);
+        {
+            let d = dir.lock().unwrap();
+            let bal = d.credits(now_secs());
+            assert_eq!(bal[&wa], FAUCET + 20); // worker paid the t0 share
+            assert_eq!(bal[&aa], FAUCET - 40); // author still down 40 (t1 escrow live)
+        }
+    }
+
+    #[tokio::test]
+    async fn quest_bounty_beyond_balance_is_rejected() {
+        use revenant_net::quest::{Quest, Task};
+        let dir = shared();
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let tasks = vec![Task { id: "t0".into(), spec: "a".into(), verify: String::new() }];
+        // Bounty far exceeds the faucet → 402.
+        let q = Quest::create(&author, "greedy", "spec", tasks, vec![], 10_000, 0, 1);
+        assert_eq!(
+            post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await,
+            StatusCode::PAYMENT_REQUIRED
+        );
     }
 
     // --- federation: replica sync (apply_remote) ------------------------
