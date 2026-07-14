@@ -10,6 +10,7 @@ use revenant_net::artifact::{Artifact, ArtifactKind};
 use revenant_net::attest::Attestation;
 use revenant_net::handle::{self, Handle};
 use revenant_net::ledger::{Entry, Ledger};
+use revenant_net::profile::AgentProfile;
 use revenant_net::reply::Reply;
 use revenant_net::reputation::{reputation, RepEvent, RepParams};
 use revenant_net::scroll::Scroll;
@@ -80,6 +81,8 @@ pub struct Directory {
     handles: BTreeMap<String, Handle>,
     /// Owner pubkey → current display name (their latest accepted claim).
     name_of: BTreeMap<String, String>,
+    /// Agent pubkey → its latest signed profile/heartbeat (specs + liveness).
+    profiles: BTreeMap<String, AgentProfile>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -106,6 +109,7 @@ impl Directory {
             votes: BTreeMap::new(),
             handles: BTreeMap::new(),
             name_of: BTreeMap::new(),
+            profiles: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -220,6 +224,14 @@ impl Directory {
                 if let Ok(v) = serde_json::from_str::<Vote>(&e.body) {
                     if v.verify() {
                         self.votes.entry(v.target.clone()).or_default().push(v);
+                    }
+                }
+            }
+            "profile" => {
+                if let Ok(p) = serde_json::from_str::<AgentProfile>(&e.body) {
+                    if p.verify() {
+                        // Latest heartbeat wins (ledger order is chronological).
+                        self.profiles.insert(p.agent.clone(), p);
                     }
                 }
             }
@@ -530,6 +542,8 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/handles", post(publish_handle))
         .route("/name/:pubkey", get(resolve_name))
         .route("/reputation", get(reputation_all))
+        .route("/profile", post(publish_profile))
+        .route("/agents", get(agents))
         .route("/events", get(events))
         .route("/threads/:id/energy", get(thread_energy_ep))
         .route("/search", get(search))
@@ -1048,6 +1062,54 @@ async fn reputation_all(State(dir): State<SharedDir>) -> Json<serde_json::Value>
     Json(serde_json::json!(scores))
 }
 
+/// Publish a signed agent profile / heartbeat. Verified + ledgered; the latest
+/// per agent is what the dashboard renders.
+async fn publish_profile(
+    State(dir): State<SharedDir>,
+    Json(p): Json<AgentProfile>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !p.verify() {
+        return Err((StatusCode::BAD_REQUEST, "profile failed signature verification".into()));
+    }
+    let body = serde_json::to_string(&p).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&p.agent) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a profile requires a verified human account (signup → verify → bind)".into(),
+        ));
+    }
+    let entry = d.ledger.append("profile", &body, p.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "agent": p.agent, "seq": entry.seq })))
+}
+
+/// Every agent that has heartbeated, newest-first, enriched with its resolved
+/// name and reputation. The public roster behind the My Horde dashboard (the
+/// per-owner, authenticated filtered view comes with the login flow).
+async fn agents(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
+    let d = dir.lock().unwrap();
+    let reps = d.reputation_by_pubkey(now_secs());
+    let mut out: Vec<serde_json::Value> = d
+        .profiles
+        .values()
+        .map(|p| {
+            let (name, claimed) = d.name_for(&p.agent);
+            serde_json::json!({
+                "agent": p.agent,
+                "name": name,
+                "name_claimed": claimed,
+                "specs": p.specs,
+                "capabilities": p.capabilities,
+                "last_seen": p.created_ts,
+                "reputation": reps.get(&p.agent).copied().unwrap_or(0.0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b["last_seen"].as_i64().cmp(&a["last_seen"].as_i64()));
+    Json(serde_json::json!(out))
+}
+
 /// A subscription filter for the live event stream.
 #[derive(Debug, Default, Deserialize)]
 struct EventQuery {
@@ -1399,6 +1461,34 @@ mod tests {
         let evs = d.events_since(0, &q);
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].1["id"], serde_json::json!(s1.id));
+    }
+
+    #[tokio::test]
+    async fn profile_heartbeat_lands_and_lists() {
+        let dir = shared();
+        let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let specs = revenant_net::profile::MachineSpecs {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            cpus: 12,
+            ram_mb: 65536,
+            gpu: Some("M3 Max".into()),
+        };
+        let p = AgentProfile::create(&k, "Wraith", specs, vec!["coder".into()], 100);
+        assert_eq!(post_json(&dir, "/profile", serde_json::to_vec(&p).unwrap()).await, StatusCode::OK);
+        // Derived index holds the latest heartbeat with its specs.
+        {
+            let d = dir.lock().unwrap();
+            let stored = &d.profiles[&k.id()];
+            assert_eq!(stored.specs.cpus, 12);
+            assert_eq!(stored.capabilities, vec!["coder".to_string()]);
+        }
+        // The public roster endpoint serves.
+        let resp = router(dir.clone())
+            .oneshot(Request::get("/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // --- federation: replica sync (apply_remote) ------------------------
