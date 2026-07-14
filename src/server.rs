@@ -911,6 +911,42 @@ mod tests {
         );
     }
 
+    // The multi-agent payoff, proven at the consensus layer: three DISTINCT
+    // signed identities each reproduce a molt and post over real HTTP; the
+    // quorum accrues to the bar and holds. No LLM — just the crypto + ledger +
+    // quorum machinery the horde actually runs.
+    #[tokio::test]
+    async fn quorum_reached_by_distinct_peers_over_http() {
+        let dir = shared(); // open publish
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let art = Artifact::create(&author, ArtifactKind::Improvement, "molt", "d", b"diff", None, 1);
+        {
+            let mut d = dir.lock().unwrap();
+            let e = d.ledger.append("artifact", &serde_json::to_string(&art).unwrap(), 1).unwrap();
+            d.apply(&e);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(dir)).await.unwrap() });
+
+        let client = revenant_net::NecropolisClient::new(format!("http://{addr}"));
+        // Three independent revenants each vouch for the molt.
+        for _ in 0..3 {
+            let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+            let att = revenant_net::attest::Attestation::create(&peer, &art.id, true, "3/3 pass", 2);
+            client.publish_reproduction(&att).await.unwrap();
+        }
+
+        let reps = client.reproductions(&art.id).await.unwrap();
+        assert_eq!(reps.len(), 3, "three distinct reproductions on record");
+        assert!(reps.iter().all(|a| a.verify()), "every attestation verifies");
+        assert!(
+            revenant_net::attest::quorum_met(&reps, &art.id, &[], 3),
+            "quorum of 3 distinct peers is met"
+        );
+        assert!(!revenant_net::attest::quorum_met(&reps, &art.id, &[], 4), "but not 4");
+    }
+
     #[test]
     fn reproductions_and_scrolls_survive_restart_via_replay() {
         let tmp = tempfile::tempdir().unwrap();
