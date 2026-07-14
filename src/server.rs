@@ -11,6 +11,7 @@ use revenant_net::attest::Attestation;
 use revenant_net::handle::{self, Handle};
 use revenant_net::ledger::{Entry, Ledger};
 use revenant_net::profile::AgentProfile;
+use revenant_net::quest::{Quest, TaskClaim, TaskResult};
 use revenant_net::reply::Reply;
 use revenant_net::reputation::{reputation, RepEvent, RepParams};
 use revenant_net::scroll::Scroll;
@@ -35,6 +36,10 @@ use std::time::Duration;
 const THREAD_E0: f64 = 1.0;
 const THREAD_GAMMA: f64 = 0.6;
 const THREAD_E_MIN: f64 = 0.05;
+
+/// A task claim's lease — how long a claim holds a task before it lapses and the
+/// task re-opens for another worker. Generous enough for real work.
+const CLAIM_LEASE_SECS: i64 = 1800; // 30 minutes
 
 /// Wall-clock unix seconds — for reputation time-decay. Deterministic tests
 /// pass an explicit `now` instead.
@@ -83,6 +88,13 @@ pub struct Directory {
     name_of: BTreeMap<String, String>,
     /// Agent pubkey → its latest signed profile/heartbeat (specs + liveness).
     profiles: BTreeMap<String, AgentProfile>,
+    /// Distributed-solving work queue, all keyed for O(1) state assembly.
+    quests: BTreeMap<String, Quest>,
+    /// Signed claims keyed by (quest_id, task_id) — the active lease is the
+    /// latest unexpired one with no result yet.
+    claims: BTreeMap<(String, String), Vec<TaskClaim>>,
+    /// Signed results keyed by (quest_id, task_id).
+    results: BTreeMap<(String, String), Vec<TaskResult>>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -110,6 +122,9 @@ impl Directory {
             handles: BTreeMap::new(),
             name_of: BTreeMap::new(),
             profiles: BTreeMap::new(),
+            quests: BTreeMap::new(),
+            claims: BTreeMap::new(),
+            results: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -232,6 +247,30 @@ impl Directory {
                     if p.verify() {
                         // Latest heartbeat wins (ledger order is chronological).
                         self.profiles.insert(p.agent.clone(), p);
+                    }
+                }
+            }
+            "quest" => {
+                if let Ok(q) = serde_json::from_str::<Quest>(&e.body) {
+                    if q.verify() {
+                        self.quests.entry(q.id.clone()).or_insert(q);
+                    }
+                }
+            }
+            "claim" => {
+                if let Ok(c) = serde_json::from_str::<TaskClaim>(&e.body) {
+                    if c.verify() {
+                        self.claims.entry((c.quest.clone(), c.task.clone())).or_default().push(c);
+                    }
+                }
+            }
+            "result" => {
+                if let Ok(r) = serde_json::from_str::<TaskResult>(&e.body) {
+                    if r.verify() {
+                        let list = self.results.entry((r.quest.clone(), r.task.clone())).or_default();
+                        if !list.iter().any(|x| x.id == r.id) {
+                            list.push(r);
+                        }
                     }
                 }
             }
@@ -504,6 +543,64 @@ impl Directory {
         }
         out
     }
+
+    /// The worker currently holding a task's lease, if any — the most recent
+    /// claim within the lease window, unless a result already exists (then the
+    /// lease is moot).
+    fn active_claim(&self, quest: &str, task: &str, now: i64) -> Option<&TaskClaim> {
+        let key = (quest.to_string(), task.to_string());
+        if self.results.get(&key).is_some_and(|r| !r.is_empty()) {
+            return None;
+        }
+        self.claims
+            .get(&key)?
+            .iter()
+            .filter(|c| now - c.created_ts < CLAIM_LEASE_SECS)
+            .max_by_key(|c| c.created_ts)
+    }
+
+    /// Count of a quest's tasks that are neither solved nor under a live lease.
+    fn open_task_count(&self, q: &Quest, now: i64) -> usize {
+        q.tasks
+            .iter()
+            .filter(|t| {
+                let key = (q.id.clone(), t.id.clone());
+                let solved = self.results.get(&key).is_some_and(|r| !r.is_empty());
+                !solved && self.active_claim(&q.id, &t.id, now).is_none()
+            })
+            .count()
+    }
+
+    /// Full per-task state of a quest, for the board.
+    fn quest_state(&self, quest: &str, now: i64) -> Option<serde_json::Value> {
+        let q = self.quests.get(quest)?;
+        let tasks: Vec<serde_json::Value> = q
+            .tasks
+            .iter()
+            .map(|t| {
+                let key = (quest.to_string(), t.id.clone());
+                let results = self.results.get(&key).map(|r| r.len()).unwrap_or(0);
+                let claim = self.active_claim(quest, &t.id, now);
+                let status = if results > 0 {
+                    "solved"
+                } else if claim.is_some() {
+                    "claimed"
+                } else {
+                    "open"
+                };
+                serde_json::json!({
+                    "id": t.id, "spec": t.spec, "verify": t.verify, "status": status,
+                    "claimant": claim.map(|c| c.worker.clone()), "results": results,
+                })
+            })
+            .collect();
+        let (name, _) = self.name_for(&q.author);
+        Some(serde_json::json!({
+            "id": q.id, "author": q.author, "author_name": name, "title": q.title,
+            "spec": q.spec, "sigils": q.sigils, "deadline_ts": q.deadline_ts,
+            "created_ts": q.created_ts, "tasks": tasks,
+        }))
+    }
 }
 
 fn bump(peers: &mut BTreeMap<String, Peer>, id: &str, f: impl FnOnce(&mut Reputation)) {
@@ -546,6 +643,10 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/agents", get(agents))
         .route("/events", get(events))
         .route("/threads/:id/energy", get(thread_energy_ep))
+        .route("/quests", post(publish_quest).get(quests))
+        .route("/quests/:id", get(quest_detail))
+        .route("/claims", post(publish_claim))
+        .route("/results", post(publish_result))
         .route("/search", get(search))
         .route("/sigils", get(sigils))
         .route("/ledger/head", get(ledger_head))
@@ -1251,6 +1352,124 @@ async fn thread_energy_ep(
     }))
 }
 
+/// Post a signed Quest — a decomposed problem for the horde to solve.
+async fn publish_quest(
+    State(dir): State<SharedDir>,
+    Json(q): Json<Quest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !q.verify() {
+        return Err((StatusCode::BAD_REQUEST, "quest failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&q).map_err(ise)?;
+    let id = q.id.clone();
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&q.author) {
+        return Err((StatusCode::FORBIDDEN, "posting a quest requires a verified human account".into()));
+    }
+    let entry = d.ledger.append("quest", &body, q.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "seq": entry.seq })))
+}
+
+#[derive(Deserialize)]
+struct QuestsQuery {
+    sigil: Option<String>,
+}
+
+/// Open quests with work left (deadline not past, ≥1 open task), newest-first,
+/// optionally matched to a sigil — the board a worker scans for tasks.
+async fn quests(State(dir): State<SharedDir>, Query(q): Query<QuestsQuery>) -> Json<serde_json::Value> {
+    use revenant_net::scroll::norm_label;
+    let now = now_secs();
+    let sigil = q.sigil.as_deref().map(norm_label);
+    let d = dir.lock().unwrap();
+    let mut out: Vec<serde_json::Value> = d
+        .quests
+        .values()
+        .filter(|qu| qu.deadline_ts == 0 || qu.deadline_ts > now)
+        .filter(|qu| sigil.as_ref().is_none_or(|s| qu.sigils.contains(s)))
+        .filter_map(|qu| {
+            let open = d.open_task_count(qu, now);
+            if open == 0 {
+                return None; // nothing left to claim
+            }
+            let (name, _) = d.name_for(&qu.author);
+            Some(serde_json::json!({
+                "id": qu.id, "title": qu.title, "author": qu.author, "author_name": name,
+                "sigils": qu.sigils, "open_tasks": open, "total_tasks": qu.tasks.len(),
+                "deadline_ts": qu.deadline_ts, "created_ts": qu.created_ts,
+            }))
+        })
+        .collect();
+    out.sort_by(|a, b| b["created_ts"].as_i64().cmp(&a["created_ts"].as_i64()));
+    Json(serde_json::json!(out))
+}
+
+/// Full per-task state of one quest.
+async fn quest_detail(
+    State(dir): State<SharedDir>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    dir.lock()
+        .unwrap()
+        .quest_state(&id, now_secs())
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "no such quest".into()))
+}
+
+/// Claim a task under a lease. Rejected (409) if another worker holds a live one.
+async fn publish_claim(
+    State(dir): State<SharedDir>,
+    Json(c): Json<TaskClaim>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !c.verify() {
+        return Err((StatusCode::BAD_REQUEST, "claim failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&c).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&c.worker) {
+        return Err((StatusCode::FORBIDDEN, "claiming a task requires a verified human account".into()));
+    }
+    {
+        let q = d.quests.get(&c.quest).ok_or((StatusCode::NOT_FOUND, "no such quest".to_string()))?;
+        if !q.tasks.iter().any(|t| t.id == c.task) {
+            return Err((StatusCode::NOT_FOUND, "no such task in that quest".into()));
+        }
+    }
+    let now = now_secs();
+    if d.active_claim(&c.quest, &c.task, now).is_some_and(|a| a.worker != c.worker) {
+        return Err((StatusCode::CONFLICT, "task already claimed by another worker (lease active)".into()));
+    }
+    let entry = d.ledger.append("claim", &body, c.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "quest": c.quest, "task": c.task, "lease_secs": CLAIM_LEASE_SECS })))
+}
+
+/// Publish a signed result for a task.
+async fn publish_result(
+    State(dir): State<SharedDir>,
+    Json(r): Json<TaskResult>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !r.verify() {
+        return Err((StatusCode::BAD_REQUEST, "result failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&r).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&r.worker) {
+        return Err((StatusCode::FORBIDDEN, "publishing a result requires a verified human account".into()));
+    }
+    {
+        let q = d.quests.get(&r.quest).ok_or((StatusCode::NOT_FOUND, "no such quest".to_string()))?;
+        if !q.tasks.iter().any(|t| t.id == r.task) {
+            return Err((StatusCode::NOT_FOUND, "no such task in that quest".into()));
+        }
+    }
+    let entry = d.ledger.append("result", &body, r.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    let n = d.results.get(&(r.quest.clone(), r.task.clone())).map(|v| v.len()).unwrap_or(0);
+    Ok(Json(serde_json::json!({ "ok": true, "quest": r.quest, "task": r.task, "results": n })))
+}
+
 async fn ledger_head(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
     let d = dir.lock().unwrap();
     Json(serde_json::json!({
@@ -1629,6 +1848,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn quest_queue_claim_lease_and_result() {
+        use revenant_net::quest::{Quest, Task, TaskClaim, TaskResult};
+        let dir = shared();
+        let mk = || Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (author, w1, w2) = (mk(), mk(), mk());
+        let tasks = vec![Task { id: "t0".into(), spec: "do it".into(), verify: String::new() }];
+        let q = Quest::create(&author, "solve", "spec", tasks, vec!["compute".into()], 0, 1);
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
+
+        // Claims must be stamped ~now so the lease is live.
+        let now = now_secs();
+        let c1 = TaskClaim::create(&w1, &q.id, "t0", now);
+        assert_eq!(post_json(&dir, "/claims", serde_json::to_vec(&c1).unwrap()).await, StatusCode::OK);
+        // A second worker can't claim the leased task.
+        let c2 = TaskClaim::create(&w2, &q.id, "t0", now);
+        assert_eq!(
+            post_json(&dir, "/claims", serde_json::to_vec(&c2).unwrap()).await,
+            StatusCode::CONFLICT
+        );
+        // But the holder can post a result.
+        let r = TaskResult::create(&w1, &q.id, "t0", "answer=42", now);
+        assert_eq!(post_json(&dir, "/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
+        // Task now reads solved; the quest drops off the open board (no open tasks).
+        let d = dir.lock().unwrap();
+        let state = d.quest_state(&q.id, now).unwrap();
+        assert_eq!(state["tasks"][0]["status"], serde_json::json!("solved"));
+        assert_eq!(d.open_task_count(&q, now), 0);
+        // A claim on a nonexistent task is rejected.
     }
 
     // --- federation: replica sync (apply_remote) ------------------------
