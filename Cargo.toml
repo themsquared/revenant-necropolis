@@ -32,3 +32,9 @@ rand = "0.8"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# In-process router tests (ServiceExt::oneshot) + temp ledger files. These were
+# referenced by the test module but never declared, so `cargo test` was red.
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

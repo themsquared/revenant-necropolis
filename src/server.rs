@@ -7,7 +7,9 @@
 //! and re-verifying the chain — federation without consensus.
 
 use revenant_net::artifact::{Artifact, ArtifactKind};
+use revenant_net::attest::Attestation;
 use revenant_net::ledger::{Entry, Ledger};
+use revenant_net::scroll::Scroll;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -35,6 +37,12 @@ pub struct Directory {
     accounts: crate::accounts::Accounts,
     peers: BTreeMap<String, Peer>,
     artifacts: BTreeMap<String, Artifact>,
+    /// Signed reproduction attestations, keyed by the artifact id they vouch
+    /// for. At most one per attester per artifact (later ones ignored) so the
+    /// quorum count can't be inflated by re-publishing.
+    reproductions: BTreeMap<String, Vec<Attestation>>,
+    /// Vault Scrolls, in ledger (append) order; the feed serves newest-first.
+    scrolls: Vec<Scroll>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -55,6 +63,8 @@ impl Directory {
             accounts,
             peers: BTreeMap::new(),
             artifacts: BTreeMap::new(),
+            reproductions: BTreeMap::new(),
+            scrolls: Vec::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -133,6 +143,30 @@ impl Directory {
                     }
                 }
             }
+            "reproduction" => {
+                if let Ok(a) = serde_json::from_str::<Attestation>(&e.body) {
+                    let list = self.reproductions.entry(a.artifact_id.clone()).or_default();
+                    // One reproduction per attester per artifact — later ones are
+                    // ignored so the quorum count can't be padded by resubmitting.
+                    if !list.iter().any(|x| x.attester == a.attester) {
+                        // Credit the improvement's author when a peer reproduces.
+                        if a.reproduced {
+                            if let Some(art) = self.artifacts.get(&a.artifact_id) {
+                                let author = art.author.clone();
+                                bump(&mut self.peers, &author, |r| r.adopted += 1);
+                            }
+                        }
+                        list.push(a);
+                    }
+                }
+            }
+            "scroll" => {
+                if let Ok(s) = serde_json::from_str::<Scroll>(&e.body) {
+                    if !self.scrolls.iter().any(|x| x.id == s.id) {
+                        self.scrolls.push(s);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -162,6 +196,12 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/artifacts", post(publish).get(list))
         .route("/artifacts/:id", get(fetch))
         .route("/artifacts/:id/attest", post(attest))
+        // Signed reproduction attestations (the promotion quorum's input) and
+        // the Vault feed. Reads open; writes gated by signature + account.
+        .route("/reproductions", post(publish_reproduction))
+        .route("/artifacts/:id/reproductions", get(list_reproductions))
+        .route("/scrolls", post(publish_scroll).get(feed))
+        .route("/scrolls/:id", get(fetch_scroll))
         .route("/ledger/head", get(ledger_head))
         .route("/ledger/since/:seq", get(ledger_since))
         .route("/account/register", post(account_register))
@@ -396,6 +436,99 @@ async fn attest(
     let entry = d.ledger.append("attest", &body, ts).map_err(ise)?;
     d.apply(&entry);
     Ok(Json(serde_json::json!({ "ok": true, "seq": entry.seq })))
+}
+
+/// Publish a signed reproduction attestation — a peer's proof it re-ran an
+/// improvement's eval and reproduced (or didn't) the win. Verified + ledgered;
+/// the quorum is derived from these.
+async fn publish_reproduction(
+    State(dir): State<SharedDir>,
+    Json(att): Json<Attestation>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !att.verify() {
+        return Err((StatusCode::BAD_REQUEST, "attestation failed signature verification".into()));
+    }
+    let body = serde_json::to_string(&att).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&att.attester) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "attesting requires a verified human account (signup → verify → bind)".into(),
+        ));
+    }
+    let entry = d.ledger.append("reproduction", &body, att.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    let count = d.reproductions.get(&att.artifact_id).map(|v| v.len()).unwrap_or(0);
+    Ok(Json(serde_json::json!({ "ok": true, "seq": entry.seq, "reproductions": count })))
+}
+
+/// All signed reproductions vouching for an artifact (the raw quorum input).
+async fn list_reproductions(
+    State(dir): State<SharedDir>,
+    Path(id): Path<String>,
+) -> Json<Vec<Attestation>> {
+    Json(dir.lock().unwrap().reproductions.get(&id).cloned().unwrap_or_default())
+}
+
+/// Inscribe a signed Vault Scroll (a milestone entry linking proven artifacts).
+async fn publish_scroll(
+    State(dir): State<SharedDir>,
+    Json(scroll): Json<Scroll>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !scroll.verify() {
+        return Err((StatusCode::BAD_REQUEST, "scroll failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&scroll).map_err(ise)?;
+    let id = scroll.id.clone();
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&scroll.author) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "inscribing a scroll requires a verified human account (signup → verify → bind)".into(),
+        ));
+    }
+    let entry = d.ledger.append("scroll", &body, scroll.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "id": id, "seq": entry.seq })))
+}
+
+#[derive(Deserialize)]
+struct FeedQuery {
+    author: Option<String>,
+    #[serde(rename = "ref")]
+    artifact: Option<String>,
+    limit: Option<usize>,
+}
+
+/// The public feed: Scrolls newest-first, optionally filtered by author or by a
+/// referenced artifact id. `limit` caps the count (default 50, max 200).
+async fn feed(State(dir): State<SharedDir>, Query(q): Query<FeedQuery>) -> Json<Vec<Scroll>> {
+    let limit = q.limit.unwrap_or(50).min(200);
+    let d = dir.lock().unwrap();
+    let out: Vec<Scroll> = d
+        .scrolls
+        .iter()
+        .rev() // ledger order is oldest-first; feed is newest-first
+        .filter(|s| q.author.as_ref().is_none_or(|a| &s.author == a))
+        .filter(|s| q.artifact.as_ref().is_none_or(|r| s.refs.contains(r)))
+        .take(limit)
+        .cloned()
+        .collect();
+    Json(out)
+}
+
+async fn fetch_scroll(
+    State(dir): State<SharedDir>,
+    Path(id): Path<String>,
+) -> Result<Json<Scroll>, (StatusCode, String)> {
+    dir.lock()
+        .unwrap()
+        .scrolls
+        .iter()
+        .find(|s| s.id == id)
+        .cloned()
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "no such scroll".into()))
 }
 
 async fn ledger_head(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
@@ -703,5 +836,100 @@ mod tests {
         assert_eq!(sync_once(&replica, &client).await.unwrap(), 1);
         assert_eq!(sync_once(&replica, &client).await.unwrap(), 0);
         assert!(replica.lock().unwrap().artifacts.contains_key(&a.id));
+    }
+
+    // --- reproductions + Vault posts ------------------------------------
+
+    async fn post_json(dir: &SharedDir, path: &str, body: Vec<u8>) -> StatusCode {
+        router(dir.clone())
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn reproduction_is_verified_ledgered_and_served() {
+        let dir = shared();
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let art = Artifact::create(&author, ArtifactKind::Improvement, "molt", "d", b"diff", None, 1);
+        assert_eq!(post_json(&dir, "/artifacts", serde_json::to_vec(&art).unwrap()).await, StatusCode::OK);
+
+        let att = Attestation::create(&peer, &art.id, true, "12/12 pass", 2);
+        assert_eq!(post_json(&dir, "/reproductions", serde_json::to_vec(&att).unwrap()).await, StatusCode::OK);
+
+        // Served back for that artifact, and the author got adoption credit.
+        // (Single lock scope — holding the guard while re-locking would deadlock.)
+        let d = dir.lock().unwrap();
+        assert_eq!(d.reproductions[&art.id].len(), 1);
+        assert_eq!(d.peers[&author.id()].reputation.adopted, 1);
+    }
+
+    #[tokio::test]
+    async fn reproduction_rejects_tampered_signature() {
+        let dir = shared();
+        let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let mut att = Attestation::create(&peer, "molt", true, "ok", 1);
+        att.reproduced = false; // flip after signing
+        assert_eq!(
+            post_json(&dir, "/reproductions", serde_json::to_vec(&att).unwrap()).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn scroll_is_verified_ledgered_and_fed() {
+        let dir = shared();
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let s = Scroll::create(&author, "laid down a 12% latency molt", vec!["molt-abc".into()], 5);
+        assert_eq!(post_json(&dir, "/scrolls", serde_json::to_vec(&s).unwrap()).await, StatusCode::OK);
+
+        // Feed serves it; filter by the referenced artifact matches.
+        let r = router(dir.clone())
+            .oneshot(Request::get("/scrolls?ref=molt-abc").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(dir.lock().unwrap().scrolls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scroll_rejects_tampered_body() {
+        let dir = shared();
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let mut s = Scroll::create(&author, "hello", vec![], 1);
+        s.body = "tampered".into();
+        assert_eq!(
+            post_json(&dir, "/scrolls", serde_json::to_vec(&s).unwrap()).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn reproductions_and_scrolls_survive_restart_via_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("n.db").to_string_lossy().to_string();
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let peer = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let art = Artifact::create(&author, ArtifactKind::Improvement, "m", "d", b"x", None, 1);
+        let att = Attestation::create(&peer, &art.id, true, "", 2);
+        let scroll = Scroll::create(&author, "shipped", vec![art.id.clone()], 3);
+        {
+            let d = Directory::open(&path).unwrap();
+            d.ledger.append("artifact", &serde_json::to_string(&art).unwrap(), 1).unwrap();
+            d.ledger.append("reproduction", &serde_json::to_string(&att).unwrap(), 2).unwrap();
+            d.ledger.append("scroll", &serde_json::to_string(&scroll).unwrap(), 3).unwrap();
+        }
+        // Reopen: both derived indices rebuild purely from the ledger.
+        let d2 = Directory::open(&path).unwrap();
+        assert_eq!(d2.reproductions[&art.id].len(), 1);
+        assert_eq!(d2.scrolls.len(), 1);
+        assert_eq!(d2.scrolls[0].id, scroll.id);
     }
 }
