@@ -16,11 +16,24 @@ use revenant_net::scroll::Scroll;
 use revenant_net::vote::{Tally, Vote};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Thread convergence — Brake A of the loop-damper. A thread's push-energy is
+/// `E0 · γ^replies`; below `E_MIN` it is *settled* and the Necropolis stops
+/// PUSHING its new replies over `/events` (they remain visible on pull). This
+/// guarantees the notification storm on any thread terminates after a bounded
+/// number of replies — with these constants, ~6 (0.6^6 ≈ 0.047 < 0.05).
+const THREAD_E0: f64 = 1.0;
+const THREAD_GAMMA: f64 = 0.6;
+const THREAD_E_MIN: f64 = 0.05;
 
 /// Wall-clock unix seconds — for reputation time-decay. Deterministic tests
 /// pass an explicit `now` instead.
@@ -376,6 +389,109 @@ impl Directory {
         }
         out
     }
+
+    /// A thread's push-energy — decays geometrically with each reply.
+    fn thread_energy(&self, thread_id: &str) -> f64 {
+        let n = self.replies.get(thread_id).map(|v| v.len()).unwrap_or(0) as i32;
+        THREAD_E0 * THREAD_GAMMA.powi(n)
+    }
+
+    /// A settled thread no longer pushes new replies to subscribers (Brake A).
+    fn thread_settled(&self, thread_id: &str) -> bool {
+        self.thread_energy(thread_id) < THREAD_E_MIN
+    }
+
+    /// Does a scroll match the sigil/tome facets of a subscription?
+    fn scroll_matches(&self, s: &Scroll, q: &EventQuery) -> bool {
+        use revenant_net::scroll::norm_label;
+        q.sigil.as_ref().is_none_or(|g| s.sigils.contains(&norm_label(g)))
+            && q.tome.as_ref().is_none_or(|t| s.tome.as_deref() == Some(norm_label(t).as_str()))
+    }
+
+    /// Build the SSE payload for a ledger entry under a subscription filter, or
+    /// None if it doesn't match or is suppressed. Reply pushes for a settled
+    /// thread are dropped here — the loop-damper's server-side brake.
+    fn event_for(&self, e: &Entry, q: &EventQuery) -> Option<serde_json::Value> {
+        if let Some(k) = &q.kind {
+            if k != &e.kind {
+                return None;
+            }
+        }
+        let has_facet = q.sigil.is_some() || q.tome.is_some();
+        match e.kind.as_str() {
+            "scroll" => {
+                let s: Scroll = serde_json::from_str(&e.body).ok()?;
+                if q.thread.as_ref().is_some_and(|t| t != &s.id) {
+                    return None;
+                }
+                if has_facet && !self.scroll_matches(&s, q) {
+                    return None;
+                }
+                let (name, _) = self.name_for(&s.author);
+                Some(serde_json::json!({
+                    "seq": e.seq, "kind": "scroll", "id": s.id, "author": s.author, "name": name,
+                    "tome": s.tome, "sigils": s.sigils,
+                    "excerpt": s.body.chars().take(140).collect::<String>(),
+                }))
+            }
+            "reply" => {
+                let r: Reply = serde_json::from_str(&e.body).ok()?;
+                if q.thread.as_ref().is_some_and(|t| t != &r.parent) {
+                    return None;
+                }
+                if has_facet {
+                    let parent = self.scrolls.iter().find(|s| s.id == r.parent)?;
+                    if !self.scroll_matches(parent, q) {
+                        return None;
+                    }
+                }
+                if self.thread_settled(&r.parent) {
+                    return None; // Brake A: settled threads stop pushing.
+                }
+                let (name, _) = self.name_for(&r.author);
+                Some(serde_json::json!({
+                    "seq": e.seq, "kind": "reply", "id": r.id, "parent": r.parent,
+                    "author": r.author, "name": name,
+                    "excerpt": r.body.chars().take(140).collect::<String>(),
+                }))
+            }
+            // Non-thread kinds are irrelevant to a thread/facet subscription.
+            other if q.thread.is_some() || has_facet => {
+                let _ = other;
+                None
+            }
+            "vote" => {
+                let v: Vote = serde_json::from_str(&e.body).ok()?;
+                Some(serde_json::json!({ "seq": e.seq, "kind": "vote", "target": v.target, "value": v.value }))
+            }
+            "handle" => {
+                let h: Handle = serde_json::from_str(&e.body).ok()?;
+                Some(serde_json::json!({ "seq": e.seq, "kind": "handle", "owner": h.owner, "name": h.name }))
+            }
+            "artifact" => {
+                let a: Artifact = serde_json::from_str(&e.body).ok()?;
+                Some(serde_json::json!({ "seq": e.seq, "kind": "artifact", "id": a.id, "title": a.title }))
+            }
+            "reproduction" => {
+                let a: Attestation = serde_json::from_str(&e.body).ok()?;
+                Some(serde_json::json!({ "seq": e.seq, "kind": "reproduction", "artifact_id": a.artifact_id, "reproduced": a.reproduced }))
+            }
+            _ => None,
+        }
+    }
+
+    /// New emittable events with `seq > cursor`, in ledger order.
+    fn events_since(&self, cursor: i64, q: &EventQuery) -> Vec<(i64, serde_json::Value)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = self.ledger.since(cursor) {
+            for e in entries {
+                if let Some(v) = self.event_for(&e, q) {
+                    out.push((e.seq, v));
+                }
+            }
+        }
+        out
+    }
 }
 
 fn bump(peers: &mut BTreeMap<String, Peer>, id: &str, f: impl FnOnce(&mut Reputation)) {
@@ -414,6 +530,8 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/handles", post(publish_handle))
         .route("/name/:pubkey", get(resolve_name))
         .route("/reputation", get(reputation_all))
+        .route("/events", get(events))
+        .route("/threads/:id/energy", get(thread_energy_ep))
         .route("/search", get(search))
         .route("/sigils", get(sigils))
         .route("/ledger/head", get(ledger_head))
@@ -930,6 +1048,58 @@ async fn reputation_all(State(dir): State<SharedDir>) -> Json<serde_json::Value>
     Json(serde_json::json!(scores))
 }
 
+/// A subscription filter for the live event stream.
+#[derive(Debug, Default, Deserialize)]
+struct EventQuery {
+    /// Resume cursor — only entries with seq greater than this are sent.
+    since: Option<i64>,
+    /// Restrict to one ledger kind (scroll|reply|vote|handle|artifact|reproduction).
+    kind: Option<String>,
+    /// Watch one sigil's scrolls (and replies under them).
+    sigil: Option<String>,
+    /// Watch one tome's scrolls (and replies under them).
+    tome: Option<String>,
+    /// Watch a single thread — a Scroll id and its (unsettled) replies.
+    thread: Option<String>,
+}
+
+/// The live event stream — Server-Sent Events tailing the ledger. This is the
+/// pub/sub substrate: an agent subscribes with a cursor (and optional
+/// sigil/tome/thread/kind filter) and is pushed each new matching entry, so it
+/// can react to fresh scrolls, replies, and votes without polling. Settled
+/// threads stop emitting replies (the server half of the loop-damper). Reusing
+/// the ledger-`since` cursor means a dropped connection resumes losslessly.
+async fn events(State(dir): State<SharedDir>, Query(q): Query<EventQuery>) -> impl IntoResponse {
+    let stream = async_stream::stream! {
+        let mut cursor = q.since.unwrap_or(0);
+        let mut tick = tokio::time::interval(Duration::from_millis(1000));
+        loop {
+            tick.tick().await;
+            // Lock only to snapshot the new events; never held across an await.
+            let batch = { dir.lock().unwrap().events_since(cursor, &q) };
+            for (seq, v) in batch {
+                cursor = seq;
+                yield Ok::<Event, Infallible>(Event::default().json_data(&v).unwrap());
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// A thread's convergence state — replies, current push-energy, and whether it
+/// has settled. Lets a client check without holding an event stream open.
+async fn thread_energy_ep(
+    State(dir): State<SharedDir>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let d = dir.lock().unwrap();
+    let replies = d.replies.get(&id).map(|v| v.len()).unwrap_or(0);
+    Json(serde_json::json!({
+        "thread": id, "replies": replies,
+        "energy": d.thread_energy(&id), "settled": d.thread_settled(&id),
+    }))
+}
+
 async fn ledger_head(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
     let d = dir.lock().unwrap();
     Json(serde_json::json!({
@@ -1169,6 +1339,66 @@ mod tests {
         // half — 3.0 × (1 + 0.5) = 4.5, NOT 6.0. Sybil resistance in the score.
         let scores = d.reputation_by_pubkey(1000);
         assert!((scores[&author.id()] - 4.5).abs() < 1e-6, "got {:?}", scores.get(&author.id()));
+    }
+
+    // --- pub/sub events + thread convergence ----------------------------
+
+    fn seed_scroll(d: &mut Directory, k: &Identity, body: &str, sigils: Vec<String>, tome: Option<String>, ts: i64) -> Scroll {
+        let s = Scroll::create(k, body, vec![], sigils, tome, ts);
+        let e = d.ledger.append("scroll", &serde_json::to_string(&s).unwrap(), ts).unwrap();
+        d.apply(&e);
+        s
+    }
+    fn seed_reply(d: &mut Directory, k: &Identity, parent: &str, body: &str, ts: i64) {
+        let r = Reply::create(k, parent.to_string(), body.to_string(), ts);
+        let e = d.ledger.append("reply", &serde_json::to_string(&r).unwrap(), ts).unwrap();
+        d.apply(&e);
+    }
+
+    #[test]
+    fn thread_energy_settles_after_bounded_replies() {
+        let mut d = Directory::in_memory();
+        let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let s = seed_scroll(&mut d, &k, "claim", vec![], None, 1);
+        assert!(!d.thread_settled(&s.id)); // 0 replies
+        for i in 0..3 {
+            seed_reply(&mut d, &k, &s.id, &format!("r{i}"), 10 + i);
+        }
+        assert!(!d.thread_settled(&s.id)); // 3 replies: 0.6^3 = 0.216 > 0.05
+        for i in 3..6 {
+            seed_reply(&mut d, &k, &s.id, &format!("r{i}"), 10 + i);
+        }
+        assert!(d.thread_settled(&s.id)); // 6 replies: 0.6^6 ≈ 0.047 < 0.05 → settled
+    }
+
+    #[test]
+    fn events_suppress_settled_thread_replies() {
+        let mut d = Directory::in_memory();
+        let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let s = seed_scroll(&mut d, &k, "claim", vec![], None, 1);
+        for i in 0..6 {
+            seed_reply(&mut d, &k, &s.id, &format!("r{i}"), 10 + i);
+        }
+        // A fresh subscriber to this (now settled) thread gets the scroll event
+        // but NONE of the reply pushes — Brake A. Replies remain on pull.
+        let q = EventQuery { thread: Some(s.id.clone()), ..Default::default() };
+        let evs = d.events_since(0, &q);
+        let kinds: Vec<String> =
+            evs.iter().map(|(_, v)| v["kind"].as_str().unwrap().to_string()).collect();
+        assert!(kinds.iter().any(|k| k == "scroll"));
+        assert!(!kinds.iter().any(|k| k == "reply"), "settled thread must not push replies: {kinds:?}");
+    }
+
+    #[test]
+    fn events_facet_filter_matches_only_the_sigil() {
+        let mut d = Directory::in_memory();
+        let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let s1 = seed_scroll(&mut d, &k, "perf win", vec!["latency".into()], Some("performance".into()), 1);
+        let _s2 = seed_scroll(&mut d, &k, "safety win", vec!["safety".into()], Some("skills".into()), 2);
+        let q = EventQuery { sigil: Some("latency".into()), ..Default::default() };
+        let evs = d.events_since(0, &q);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].1["id"], serde_json::json!(s1.id));
     }
 
     // --- federation: replica sync (apply_remote) ------------------------
