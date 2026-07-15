@@ -46,6 +46,15 @@ const CLAIM_LEASE_SECS: i64 = 1800; // 30 minutes
 /// spending power is earned by solving; the faucet only seeds first moves.
 const FAUCET: i64 = 100;
 
+/// Distinct independent verifiers required to accept a result without the author
+/// (the trustless path). Each must be a different account from the solver.
+const QUORUM_VERIFICATIONS: usize = 2;
+
+/// Percent of a task's share paid to the verifiers who vouched for the accepted
+/// result (split equally); the solver takes the rest. Rewards checking, not just
+/// solving — the same reason quorum reproduction works.
+const VERIFIER_CUT_PCT: i64 = 20;
+
 /// Wall-clock unix seconds — for reputation time-decay. Deterministic tests
 /// pass an explicit `now` instead.
 fn now_secs() -> i64 {
@@ -103,6 +112,11 @@ pub struct Directory {
     /// The quest author's acceptance per task (quest_id, task_id) → the payout
     /// trigger. Only the quest author's acceptance is stored.
     accepts: BTreeMap<(String, String), TaskAccept>,
+    /// Independent verifications of a result, keyed by result id — the trustless
+    /// acceptance path: enough distinct verifiers stand in for the author.
+    verifications: BTreeMap<String, Vec<Attestation>>,
+    /// result id → (quest, task), so a verification can be located + validated.
+    result_loc: BTreeMap<String, (String, String)>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -134,6 +148,8 @@ impl Directory {
             claims: BTreeMap::new(),
             results: BTreeMap::new(),
             accepts: BTreeMap::new(),
+            verifications: BTreeMap::new(),
+            result_loc: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -276,9 +292,22 @@ impl Directory {
             "result" => {
                 if let Ok(r) = serde_json::from_str::<TaskResult>(&e.body) {
                     if r.verify() {
+                        self.result_loc.insert(r.id.clone(), (r.quest.clone(), r.task.clone()));
                         let list = self.results.entry((r.quest.clone(), r.task.clone())).or_default();
                         if !list.iter().any(|x| x.id == r.id) {
                             list.push(r);
+                        }
+                    }
+                }
+            }
+            "verify" => {
+                // An independent verifier's signed attestation that a result
+                // holds. Reuses the Attestation type with artifact_id = result id.
+                if let Ok(a) = serde_json::from_str::<Attestation>(&e.body) {
+                    if a.verify() {
+                        let list = self.verifications.entry(a.artifact_id.clone()).or_default();
+                        if !list.iter().any(|x| x.attester == a.attester) {
+                            list.push(a); // one verification per attester per result
                         }
                     }
                 }
@@ -579,14 +608,16 @@ impl Directory {
             .max_by_key(|c| c.created_ts)
     }
 
-    /// Count of a quest's tasks that are neither solved nor under a live lease.
+    /// Count of a quest's tasks that are genuinely available: not settled, no
+    /// result awaiting acceptance, and no live lease.
     fn open_task_count(&self, q: &Quest, now: i64) -> usize {
         q.tasks
             .iter()
             .filter(|t| {
                 let key = (q.id.clone(), t.id.clone());
-                let solved = self.results.get(&key).is_some_and(|r| !r.is_empty());
-                !solved && self.active_claim(&q.id, &t.id, now).is_none()
+                let settled = self.task_settlement(&q.id, &t.id).is_some();
+                let has_result = self.results.get(&key).is_some_and(|r| !r.is_empty());
+                !settled && !has_result && self.active_claim(&q.id, &t.id, now).is_none()
             })
             .count()
     }
@@ -601,8 +632,11 @@ impl Directory {
                 let key = (quest.to_string(), t.id.clone());
                 let results = self.results.get(&key).map(|r| r.len()).unwrap_or(0);
                 let claim = self.active_claim(quest, &t.id, now);
-                let status = if results > 0 {
+                let settled = self.task_settlement(quest, &t.id);
+                let status = if settled.is_some() {
                     "solved"
+                } else if results > 0 {
+                    "pending" // a result is in, awaiting acceptance/verification
                 } else if claim.is_some() {
                     "claimed"
                 } else {
@@ -611,6 +645,7 @@ impl Directory {
                 serde_json::json!({
                     "id": t.id, "spec": t.spec, "verify": t.verify, "status": status,
                     "claimant": claim.map(|c| c.worker.clone()), "results": results,
+                    "solver": settled.map(|(s, _)| s),
                 })
             })
             .collect();
@@ -633,14 +668,48 @@ impl Directory {
         }
     }
 
-    /// The credit balances, replayed from the ledger, in account space. The
-    /// model is a closed transfer system seeded by the faucet:
-    ///   * an accepted task transfers its share from the author to the solver;
-    ///   * an unaccepted task on a still-live quest keeps that share ESCROWED
-    ///     (locked out of the author's available balance);
-    ///   * an unaccepted task past the deadline is refunded (never deducted).
-    /// No credits are ever minted except the one-time per-account faucet, so a
-    /// colluding ring can shuffle but never conjure balance.
+    /// How a task settles, if it has: the solver's account and the verifier
+    /// accounts (empty when the author accepted directly). Time-independent.
+    /// Author-acceptance wins; otherwise a result with a distinct-account
+    /// verifier quorum settles it trustlessly.
+    fn task_settlement(&self, quest: &str, task: &str) -> Option<(String, Vec<String>)> {
+        let key = (quest.to_string(), task.to_string());
+        // Author accepted a specific result directly → no verifier cut.
+        if let Some(acc) = self.accepts.get(&key) {
+            if let Some(res) =
+                self.results.get(&key).and_then(|rs| rs.iter().find(|r| r.id == acc.result_id))
+            {
+                return Some((self.acct(&res.worker), vec![]));
+            }
+        }
+        // Trustless: a result whose distinct verifiers (≠ the solver) reach quorum.
+        for res in self.results.get(&key).into_iter().flatten() {
+            let solver = self.acct(&res.worker);
+            let mut verifiers: Vec<String> = Vec::new();
+            for a in self.verifications.get(&res.id).into_iter().flatten() {
+                if !a.reproduced || !a.verify() {
+                    continue;
+                }
+                let va = self.acct(&a.attester);
+                if va != solver && !verifiers.contains(&va) {
+                    verifiers.push(va);
+                }
+            }
+            if verifiers.len() >= QUORUM_VERIFICATIONS {
+                return Some((solver, verifiers));
+            }
+        }
+        None
+    }
+
+    /// The credit balances, replayed from the ledger, in account space. A closed
+    /// transfer system seeded only by the one-time per-account faucet:
+    ///   * a settled task transfers its share from the author — to the solver
+    ///     (full, on author-accept) or split solver/verifiers (on quorum);
+    ///   * an unsettled task on a live quest keeps that share ESCROWED;
+    ///   * an unsettled task past the deadline is refunded.
+    /// Nothing is minted beyond the faucet, so a ring can shuffle but never
+    /// conjure balance.
     fn credits(&self, now: i64) -> HashMap<String, i64> {
         let mut bal: HashMap<String, i64> = HashMap::new();
         for q in self.quests.values() {
@@ -651,25 +720,26 @@ impl Directory {
                 continue;
             }
             for t in &q.tasks {
-                let key = (q.id.clone(), t.id.clone());
-                match self.accepts.get(&key) {
-                    Some(acc) => {
-                        // Transfer to the accepted result's worker.
-                        if let Some(res) = self
-                            .results
-                            .get(&key)
-                            .and_then(|rs| rs.iter().find(|r| r.id == acc.result_id))
-                        {
-                            let worker = self.acct(&res.worker);
-                            *bal.entry(author.clone()).or_insert(FAUCET) -= per;
-                            *bal.entry(worker).or_insert(FAUCET) += per;
+                match self.task_settlement(&q.id, &t.id) {
+                    Some((solver, verifiers)) => {
+                        *bal.entry(author.clone()).or_insert(FAUCET) -= per;
+                        if verifiers.is_empty() {
+                            *bal.entry(solver).or_insert(FAUCET) += per; // author-accept: all to solver
+                        } else {
+                            let pool = per * VERIFIER_CUT_PCT / 100;
+                            let each = pool / verifiers.len() as i64;
+                            let paid = each * verifiers.len() as i64;
+                            *bal.entry(solver).or_insert(FAUCET) += per - paid; // remainder + dust to solver
+                            for v in verifiers {
+                                *bal.entry(v).or_insert(FAUCET) += each;
+                            }
                         }
                     }
                     None => {
                         let live = q.deadline_ts == 0 || q.deadline_ts > now;
                         if live {
                             *bal.entry(author.clone()).or_insert(FAUCET) -= per; // escrow-locked
-                        } // expired + unaccepted → refunded (no deduction)
+                        } // expired + unsettled → refunded
                     }
                 }
             }
@@ -687,6 +757,11 @@ impl Directory {
         for rs in self.results.values() {
             for r in rs {
                 pks.push(&r.worker);
+            }
+        }
+        for atts in self.verifications.values() {
+            for a in atts {
+                pks.push(&a.attester); // verifiers earn the cut — surface them too
             }
         }
         let mut out = HashMap::new();
@@ -742,6 +817,7 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/claims", post(publish_claim))
         .route("/results", post(publish_result))
         .route("/accept", post(publish_accept))
+        .route("/verify", post(publish_verify))
         .route("/credits", get(credits))
         .route("/search", get(search))
         .route("/sigils", get(sigils))
@@ -1517,6 +1593,36 @@ async fn credits(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
     Json(serde_json::json!(dir.lock().unwrap().credits_by_pubkey(now_secs())))
 }
 
+/// An independent verifier vouches for a result (artifact_id = the result id).
+/// Verified + gated; the result must exist and the verifier can't be its solver.
+/// Enough distinct verifiers settle the task trustlessly — no author needed.
+async fn publish_verify(
+    State(dir): State<SharedDir>,
+    Json(att): Json<Attestation>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !att.verify() {
+        return Err((StatusCode::BAD_REQUEST, "verification failed signature verification".into()));
+    }
+    let body = serde_json::to_string(&att).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&att.attester) {
+        return Err((StatusCode::FORBIDDEN, "verifying a result requires a verified human account".into()));
+    }
+    let Some((q, t)) = d.result_loc.get(&att.artifact_id).cloned() else {
+        return Err((StatusCode::NOT_FOUND, "no such result".into()));
+    };
+    let self_vouch = d.results.get(&(q, t)).is_some_and(|rs| {
+        rs.iter().any(|r| r.id == att.artifact_id && d.acct(&r.worker) == d.acct(&att.attester))
+    });
+    if self_vouch {
+        return Err((StatusCode::FORBIDDEN, "you can't verify your own result".into()));
+    }
+    let entry = d.ledger.append("verify", &body, att.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    let n = d.verifications.get(&att.artifact_id).map(|v| v.len()).unwrap_or(0);
+    Ok(Json(serde_json::json!({ "ok": true, "result": att.artifact_id, "verifications": n })))
+}
+
 #[derive(Deserialize)]
 struct QuestsQuery {
     sigil: Option<String>,
@@ -2019,10 +2125,11 @@ mod tests {
         // But the holder can post a result.
         let r = TaskResult::create(&w1, &q.id, "t0", "answer=42", now);
         assert_eq!(post_json(&dir, "/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
-        // Task now reads solved; the quest drops off the open board (no open tasks).
+        // A posted-but-unaccepted result reads "pending" (not yet solved), and
+        // the task is no longer "open" (it has a result awaiting acceptance).
         let d = dir.lock().unwrap();
         let state = d.quest_state(&q.id, now).unwrap();
-        assert_eq!(state["tasks"][0]["status"], serde_json::json!("solved"));
+        assert_eq!(state["tasks"][0]["status"], serde_json::json!("pending"));
         assert_eq!(d.open_task_count(&q, now), 0);
     }
 
@@ -2076,6 +2183,42 @@ mod tests {
             post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await,
             StatusCode::PAYMENT_REQUIRED
         );
+    }
+
+    #[tokio::test]
+    async fn quest_trustless_verify_settles_and_pays_cut() {
+        use revenant_net::attest::Attestation;
+        use revenant_net::quest::{Quest, Task, TaskResult};
+        let dir = shared();
+        let mk = || Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (author, worker, v1, v2) = (mk(), mk(), mk(), mk());
+        // 1 task, bounty 100 → per_task 100; 20% cut → 20 pool, 10 each, solver 80.
+        let q = Quest::create(
+            &author, "q", "spec",
+            vec![Task { id: "t0".into(), spec: "do".into(), verify: "eval".into() }],
+            vec![], 100, 0, 1,
+        );
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
+        let r = TaskResult::create(&worker, &q.id, "t0", "answer", 2);
+        assert_eq!(post_json(&dir, "/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
+
+        // The solver can't vouch for their own result.
+        let selfv = Attestation::create(&worker, &r.id, true, "", 3);
+        assert_eq!(
+            post_json(&dir, "/verify", serde_json::to_vec(&selfv).unwrap()).await,
+            StatusCode::FORBIDDEN
+        );
+        // Two independent verifiers reach quorum → the task settles trustlessly.
+        for v in [&v1, &v2] {
+            let att = Attestation::create(v, &r.id, true, "checked", 3);
+            assert_eq!(post_json(&dir, "/verify", serde_json::to_vec(&att).unwrap()).await, StatusCode::OK);
+        }
+        let d = dir.lock().unwrap();
+        let bal = d.credits(now_secs());
+        assert_eq!(bal[&worker.id()], FAUCET + 80, "solver gets per_task minus the verifier cut");
+        assert_eq!(bal[&v1.id()], FAUCET + 10, "verifier cut split");
+        assert_eq!(bal[&v2.id()], FAUCET + 10);
+        assert_eq!(bal[&author.id()], FAUCET - 100, "author debited the full task share");
     }
 
     // --- federation: replica sync (apply_remote) ------------------------
