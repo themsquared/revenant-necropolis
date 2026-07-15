@@ -12,7 +12,7 @@ use revenant_net::boost::Boost;
 use revenant_net::handle::{self, Handle};
 use revenant_net::ledger::{Entry, Ledger};
 use revenant_net::profile::AgentProfile;
-use revenant_net::quest::{Quest, TaskAccept, TaskClaim, TaskResult};
+use revenant_net::quest::{Quest, QuestClose, TaskAccept, TaskClaim, TaskResult};
 use revenant_net::reply::Reply;
 use revenant_net::reputation::{reputation, RepEvent, RepParams};
 use revenant_net::scroll::Scroll;
@@ -121,6 +121,9 @@ pub struct Directory {
     /// All verified boosts (deduped by sig) — credits spent to feature a target
     /// higher. Summed per target for ranking; debited per account for balance.
     boosts: Vec<Boost>,
+    /// Quests the author has closed out: quest id → earliest close timestamp. A
+    /// closed quest leaves the board and stops escrowing its unsettled tasks.
+    closed: BTreeMap<String, i64>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -155,6 +158,7 @@ impl Directory {
             verifications: BTreeMap::new(),
             result_loc: BTreeMap::new(),
             boosts: Vec::new(),
+            closed: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -322,6 +326,19 @@ impl Directory {
                     // Dedup by signature so a replayed entry isn't double-counted.
                     if b.verify() && !self.boosts.iter().any(|x| x.sig == b.sig) {
                         self.boosts.push(b);
+                    }
+                }
+            }
+            "close" => {
+                if let Ok(c) = serde_json::from_str::<QuestClose>(&e.body) {
+                    // Honor only the quest author's own account; earliest close wins.
+                    let by_author =
+                        self.quests.get(&c.quest).is_some_and(|q| self.acct(&q.author) == self.acct(&c.author));
+                    if c.verify() && by_author {
+                        self.closed
+                            .entry(c.quest.clone())
+                            .and_modify(|ts| *ts = (*ts).min(c.created_ts))
+                            .or_insert(c.created_ts);
                     }
                 }
             }
@@ -681,11 +698,23 @@ impl Directory {
             })
             .collect();
         let (name, _) = self.name_for(&q.author);
+        // Quest-level lifecycle: closed (author retired it) > complete (every task
+        // settled) > open (work remains).
+        let closed_ts = self.closed.get(quest).copied();
+        let all_settled = q.tasks.iter().all(|t| self.task_settlement(quest, &t.id).is_some());
+        let status = if closed_ts.is_some() {
+            "closed"
+        } else if !q.tasks.is_empty() && all_settled {
+            "complete"
+        } else {
+            "open"
+        };
         Some(serde_json::json!({
             "id": q.id, "author": q.author, "author_name": name, "title": q.title,
             "spec": q.spec, "sigils": q.sigils, "bounty": q.bounty,
             "per_task": self.per_task(q), "deadline_ts": q.deadline_ts,
             "created_ts": q.created_ts, "tasks": tasks,
+            "status": status, "closed_ts": closed_ts,
         }))
     }
 
@@ -778,10 +807,13 @@ impl Directory {
                         }
                     }
                     None => {
-                        let live = q.deadline_ts == 0 || q.deadline_ts > now;
+                        // Escrow holds only while the quest is live: still open and
+                        // not closed. Closing (or expiry) refunds unsettled tasks.
+                        let live = !self.closed.contains_key(&q.id)
+                            && (q.deadline_ts == 0 || q.deadline_ts > now);
                         if live {
                             *bal.entry(author.clone()).or_insert(FAUCET) -= per; // escrow-locked
-                        } // expired + unsettled → refunded
+                        } // closed / expired + unsettled → refunded
                     }
                 }
             }
@@ -869,6 +901,7 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/claims", post(publish_claim))
         .route("/results", post(publish_result))
         .route("/accept", post(publish_accept))
+        .route("/close", post(publish_close))
         .route("/verify", post(publish_verify))
         .route("/boost", post(publish_boost))
         .route("/credits", get(credits))
@@ -1663,7 +1696,14 @@ async fn publish_accept(
     }
     let entry = d.ledger.append("accept", &body, acc.created_ts).map_err(ise)?;
     d.apply(&entry);
-    Ok(Json(serde_json::json!({ "ok": true, "quest": acc.quest, "task": acc.task })))
+    // Signal completion so the author can close out: was that the last task?
+    let complete = d
+        .quests
+        .get(&acc.quest)
+        .is_some_and(|q| !q.tasks.is_empty() && q.tasks.iter().all(|t| d.task_settlement(&acc.quest, &t.id).is_some()));
+    Ok(Json(serde_json::json!({
+        "ok": true, "quest": acc.quest, "task": acc.task, "quest_complete": complete,
+    })))
 }
 
 /// Credit balances per agent pubkey (each inherits its account's balance).
@@ -1785,6 +1825,42 @@ async fn publish_boost(
     Ok(Json(serde_json::json!({ "ok": true, "target": b.target, "boost": total })))
 }
 
+/// Close out a quest (author only) — retires it from the board and refunds any
+/// escrow still locked on unsettled tasks. Idempotent: closing a closed quest
+/// is a no-op success. This is the "done" close after accepting results and the
+/// withdrawal path for pulling a quest before it's solved.
+async fn publish_close(
+    State(dir): State<SharedDir>,
+    Json(c): Json<QuestClose>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !c.verify() {
+        return Err((StatusCode::BAD_REQUEST, "close failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&c).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    {
+        let q = d.quests.get(&c.quest).ok_or((StatusCode::NOT_FOUND, "no such quest".to_string()))?;
+        // Author-only, at the account level (an agent of the author's account may
+        // close a quest the account posted).
+        if d.acct(&q.author) != d.acct(&c.author) {
+            return Err((StatusCode::FORBIDDEN, "only the quest's author account may close it".into()));
+        }
+    }
+    if d.closed.contains_key(&c.quest) {
+        return Ok(Json(serde_json::json!({ "ok": true, "quest": c.quest, "status": "already closed" })));
+    }
+    let refunded_before = d.credits(now_secs());
+    let acct = d.acct(&c.author);
+    let before = refunded_before.get(&acct).copied().unwrap_or(FAUCET);
+    let entry = d.ledger.append("close", &body, c.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    let after = d.credits(now_secs()).get(&acct).copied().unwrap_or(FAUCET);
+    let refunded = (after - before).max(0);
+    Ok(Json(serde_json::json!({
+        "ok": true, "quest": c.quest, "status": "closed", "refunded": refunded,
+    })))
+}
+
 #[derive(Deserialize)]
 struct QuestsQuery {
     sigil: Option<String>,
@@ -1800,6 +1876,7 @@ async fn quests(State(dir): State<SharedDir>, Query(q): Query<QuestsQuery>) -> J
     let mut out: Vec<serde_json::Value> = d
         .quests
         .values()
+        .filter(|qu| !d.closed.contains_key(&qu.id)) // closed quests leave the board
         .filter(|qu| qu.deadline_ts == 0 || qu.deadline_ts > now)
         .filter(|qu| sigil.as_ref().is_none_or(|s| qu.sigils.contains(s)))
         .filter_map(|qu| {
@@ -2457,6 +2534,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quest_close_refunds_escrow_and_leaves_board() {
+        use revenant_net::quest::{Quest, QuestClose, Task, TaskAccept, TaskResult};
+        let dir = shared();
+        let mk = || Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (author, worker) = (mk(), mk());
+        let aa = { dir.lock().unwrap().acct(&author.id()) };
+
+        // 2 tasks, 40 bounty (20 each). Author solves/accepts t0, then closes.
+        let tasks = vec![
+            Task { id: "t0".into(), spec: "a".into(), verify: String::new() },
+            Task { id: "t1".into(), spec: "b".into(), verify: String::new() },
+        ];
+        let q = Quest::create(&author, "closeme", "spec", tasks, vec![], 40, 0, 1);
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
+
+        let r = TaskResult::create(&worker, &q.id, "t0", "answer", 2);
+        assert_eq!(post_json(&dir, "/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
+        let acc = TaskAccept::create(&author, &q.id, "t0", &r.id, 3);
+        assert_eq!(post_json(&dir, "/accept", serde_json::to_vec(&acc).unwrap()).await, StatusCode::OK);
+
+        // Before close: author down the full 40 (20 paid to solver, 20 still escrowed on t1).
+        {
+            let d = dir.lock().unwrap();
+            assert_eq!(d.credits(now_secs())[&aa], FAUCET - 40);
+            assert_eq!(d.quest_state(&q.id, now_secs()).unwrap()["status"], serde_json::json!("open"));
+        }
+
+        // A non-author can't close it.
+        let intruder = mk();
+        let bad = QuestClose::create(&intruder, &q.id, 4);
+        assert_eq!(
+            post_json(&dir, "/close", serde_json::to_vec(&bad).unwrap()).await,
+            StatusCode::FORBIDDEN
+        );
+
+        // Author closes → the live t1 escrow (20) refunds; only the 20 paid stays spent.
+        let close = QuestClose::create(&author, &q.id, 5);
+        assert_eq!(post_json(&dir, "/close", serde_json::to_vec(&close).unwrap()).await, StatusCode::OK);
+        {
+            let d = dir.lock().unwrap();
+            assert_eq!(d.credits(now_secs())[&aa], FAUCET - 20, "unsettled escrow refunded on close");
+            assert_eq!(d.quest_state(&q.id, now_secs()).unwrap()["status"], serde_json::json!("closed"));
+            assert!(d.closed.contains_key(&q.id));
+        }
+        // And it's gone from the board.
+        let board = get_json(&dir, "/quests").await;
+        assert!(
+            board.as_array().unwrap().iter().all(|x| x["id"] != serde_json::json!(q.id)),
+            "closed quest must leave the board"
+        );
+    }
+
+    #[tokio::test]
     async fn quest_no_self_dealing() {
         use revenant_net::quest::{Quest, Task, TaskClaim, TaskResult};
         let dir = shared();
@@ -2640,6 +2770,15 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn get_json(dir: &SharedDir, path: &str) -> serde_json::Value {
+        let resp = router(dir.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     #[tokio::test]
