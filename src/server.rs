@@ -1542,8 +1542,8 @@ async fn quests(State(dir): State<SharedDir>, Query(q): Query<QuestsQuery>) -> J
             let (name, _) = d.name_for(&qu.author);
             Some(serde_json::json!({
                 "id": qu.id, "title": qu.title, "author": qu.author, "author_name": name,
-                "sigils": qu.sigils, "open_tasks": open, "total_tasks": qu.tasks.len(),
-                "deadline_ts": qu.deadline_ts, "created_ts": qu.created_ts,
+                "sigils": qu.sigils, "bounty": qu.bounty, "open_tasks": open,
+                "total_tasks": qu.tasks.len(), "deadline_ts": qu.deadline_ts, "created_ts": qu.created_ts,
             }))
         })
         .collect();
