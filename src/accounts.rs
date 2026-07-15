@@ -214,6 +214,25 @@ impl Accounts {
         Ok(Some(session))
     }
 
+    /// Bind an agent pubkey to the account behind a login SESSION — the way a
+    /// second machine joins an existing account without ever holding the raw
+    /// account key. The agent proves control of its key by signing the session
+    /// token; the session proves the human is logged in.
+    pub fn bind_via_session(&self, session: &str, pubkey: &str, sig_hex: &str) -> Result<()> {
+        if !revenant_net::identity::verify_hex(pubkey, session.as_bytes(), sig_hex) {
+            bail!("agent ownership proof failed (signature does not match pubkey)");
+        }
+        let account_id =
+            self.account_for_session(session).context("invalid or expired session — log in again")?;
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO agent_bindings (pubkey, account_id, bound_ts) VALUES (?1, ?2, ?3)
+             ON CONFLICT(pubkey) DO UPDATE SET account_id = ?2",
+            rusqlite::params![pubkey, account_id, now()],
+        )?;
+        Ok(())
+    }
+
     /// Resolve a session bearer to its account id, if the session is valid and
     /// unexpired (7-day TTL).
     pub fn account_for_session(&self, session: &str) -> Option<i64> {

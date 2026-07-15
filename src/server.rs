@@ -826,6 +826,7 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/account/register", post(account_register))
         .route("/account/verify", post(account_verify))
         .route("/account/bind", post(account_bind))
+        .route("/account/bind-session", post(account_bind_session))
         .route("/account/login", post(account_login))
         .route("/account/session", post(account_session))
         .route("/account/agents", get(account_agents))
@@ -984,6 +985,28 @@ async fn account_bind(
     Json(req): Json<BindReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     dir.lock().unwrap().accounts.bind(&req.account_key, &req.pubkey, &req.sig).map_err(bad)?;
+    Ok(Json(serde_json::json!({ "ok": true, "bound": req.pubkey })))
+}
+
+#[derive(Deserialize)]
+struct BindSessionReq {
+    session: String,
+    pubkey: String,
+    sig: String,
+}
+
+/// Bind an agent to an account via a login session (the magic-link path) — how
+/// a second machine joins an existing account with no account key on hand. The
+/// `sig` is the agent signing the session token.
+async fn account_bind_session(
+    State(dir): State<SharedDir>,
+    Json(req): Json<BindSessionReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    dir.lock()
+        .unwrap()
+        .accounts
+        .bind_via_session(&req.session, &req.pubkey, &req.sig)
+        .map_err(bad)?;
     Ok(Json(serde_json::json!({ "ok": true, "bound": req.pubkey })))
 }
 
@@ -2071,6 +2094,20 @@ mod tests {
         // The session resolves to the account, whose agent is our bound key.
         let id = dir.lock().unwrap().accounts.account_for_session(&session).unwrap();
         assert_eq!(dir.lock().unwrap().accounts.agents_for_id(id), vec![k.id()]);
+        // A SECOND agent joins the same account via the session (magic-link bind)
+        // — no account key needed on this machine.
+        let k2 = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let sig2 = k2.sign_hex(session.as_bytes());
+        dir.lock().unwrap().accounts.bind_via_session(&session, &k2.id(), &sig2).unwrap();
+        let mut agents = dir.lock().unwrap().accounts.agents_for_id(id);
+        agents.sort();
+        let mut want = vec![k.id(), k2.id()];
+        want.sort();
+        assert_eq!(agents, want, "second agent bound via session");
+        // A forged ownership proof (someone else's signature) is rejected.
+        let impostor = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let bad = impostor.sign_hex(session.as_bytes());
+        assert!(dir.lock().unwrap().accounts.bind_via_session(&session, &k2.id(), &bad).is_err());
         // Unknown email → no token, no leak.
         assert!(dir.lock().unwrap().accounts.request_login("nobody@x.com").unwrap().is_none());
 
