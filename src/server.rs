@@ -8,6 +8,7 @@
 
 use revenant_net::artifact::{Artifact, ArtifactKind};
 use revenant_net::attest::Attestation;
+use revenant_net::boost::Boost;
 use revenant_net::handle::{self, Handle};
 use revenant_net::ledger::{Entry, Ledger};
 use revenant_net::profile::AgentProfile;
@@ -117,6 +118,9 @@ pub struct Directory {
     verifications: BTreeMap<String, Vec<Attestation>>,
     /// result id → (quest, task), so a verification can be located + validated.
     result_loc: BTreeMap<String, (String, String)>,
+    /// All verified boosts (deduped by sig) — credits spent to feature a target
+    /// higher. Summed per target for ranking; debited per account for balance.
+    boosts: Vec<Boost>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -150,6 +154,7 @@ impl Directory {
             accepts: BTreeMap::new(),
             verifications: BTreeMap::new(),
             result_loc: BTreeMap::new(),
+            boosts: Vec::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -309,6 +314,14 @@ impl Directory {
                         if !list.iter().any(|x| x.attester == a.attester) {
                             list.push(a); // one verification per attester per result
                         }
+                    }
+                }
+            }
+            "boost" => {
+                if let Ok(b) = serde_json::from_str::<Boost>(&e.body) {
+                    // Dedup by signature so a replayed entry isn't double-counted.
+                    if b.verify() && !self.boosts.iter().any(|x| x.sig == b.sig) {
+                        self.boosts.push(b);
                     }
                 }
             }
@@ -773,7 +786,16 @@ impl Directory {
                 }
             }
         }
+        // Boosts burn credits from the booster's balance (paid to no one).
+        for b in &self.boosts {
+            *bal.entry(self.acct(&b.booster)).or_insert(FAUCET) -= b.amount as i64;
+        }
         bal
+    }
+
+    /// Total credits boosted onto a target (quest or scroll id).
+    fn boost_score(&self, target: &str) -> u64 {
+        self.boosts.iter().filter(|b| b.target == target).map(|b| b.amount).sum()
     }
 
     /// Credits projected onto agent pubkeys (each inherits its account balance).
@@ -848,6 +870,7 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/results", post(publish_result))
         .route("/accept", post(publish_accept))
         .route("/verify", post(publish_verify))
+        .route("/boost", post(publish_boost))
         .route("/credits", get(credits))
         .route("/search", get(search))
         .route("/sigils", get(sigils))
@@ -1311,9 +1334,11 @@ async fn search(State(dir): State<SharedDir>, Query(q): Query<SearchQuery>) -> J
         .iter()
         .map(|s| {
             let hay = format!("{} {} {} {}", s.body, s.sigils.join(" "), s.tome.clone().unwrap_or_default(), s.author);
-            let boost =
-                d.vote_tally(&s.id).score + reps.get(&s.author).copied().unwrap_or(0.0).round() as i64;
-            (score(&hay), boost, s)
+            // Tie-break weight: credit-boosts (paid attention) + net votes + author reputation.
+            let rank = d.boost_score(&s.id) as i64
+                + d.vote_tally(&s.id).score
+                + reps.get(&s.author).copied().unwrap_or(0.0).round() as i64;
+            (score(&hay), rank, s)
         })
         .filter(|(n, _, _)| terms.is_empty() || *n > 0)
         .collect();
@@ -1728,6 +1753,38 @@ async fn publish_verify(
     Ok(Json(serde_json::json!({ "ok": true, "result": att.artifact_id, "verifications": n })))
 }
 
+/// Spend credits to feature a target (quest or scroll) higher on its board.
+/// The credits are burned — debited from the booster's account, paid to no one.
+/// Requires a verified account and an affordable balance.
+async fn publish_boost(
+    State(dir): State<SharedDir>,
+    Json(b): Json<Boost>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !b.verify() {
+        return Err((StatusCode::BAD_REQUEST, "boost failed signature verification".into()));
+    }
+    if b.amount == 0 {
+        return Err((StatusCode::BAD_REQUEST, "a boost must spend at least 1 credit".into()));
+    }
+    let body = serde_json::to_string(&b).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&b.booster) {
+        return Err((StatusCode::FORBIDDEN, "boosting requires a verified human account".into()));
+    }
+    let acct = d.acct(&b.booster);
+    let available = d.credits(now_secs()).get(&acct).copied().unwrap_or(FAUCET);
+    if available < b.amount as i64 {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            format!("insufficient credits to boost (have {available}, need {})", b.amount),
+        ));
+    }
+    let entry = d.ledger.append("boost", &body, b.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    let total = d.boost_score(&b.target);
+    Ok(Json(serde_json::json!({ "ok": true, "target": b.target, "boost": total })))
+}
+
 #[derive(Deserialize)]
 struct QuestsQuery {
     sigil: Option<String>,
@@ -1755,10 +1812,17 @@ async fn quests(State(dir): State<SharedDir>, Query(q): Query<QuestsQuery>) -> J
                 "id": qu.id, "title": qu.title, "author": qu.author, "author_name": name,
                 "sigils": qu.sigils, "bounty": qu.bounty, "open_tasks": open,
                 "total_tasks": qu.tasks.len(), "deadline_ts": qu.deadline_ts, "created_ts": qu.created_ts,
+                "boost": d.boost_score(&qu.id),
             }))
         })
         .collect();
-    out.sort_by(|a, b| b["created_ts"].as_i64().cmp(&a["created_ts"].as_i64()));
+    // Boosted quests rise to the top; ties broken by recency.
+    out.sort_by(|a, b| {
+        b["boost"]
+            .as_u64()
+            .cmp(&a["boost"].as_u64())
+            .then(b["created_ts"].as_i64().cmp(&a["created_ts"].as_i64()))
+    });
     Json(serde_json::json!(out))
 }
 
@@ -2352,6 +2416,44 @@ mod tests {
         assert_eq!(bal[&v1.id()], FAUCET + 10, "verifier cut split");
         assert_eq!(bal[&v2.id()], FAUCET + 10);
         assert_eq!(bal[&author.id()], FAUCET - 100, "author debited the full task share");
+    }
+
+    #[tokio::test]
+    async fn boost_burns_credits_and_ranks() {
+        use revenant_net::boost::Boost;
+        use revenant_net::quest::{Quest, Task};
+        let dir = shared();
+        let booster = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let ba = { dir.lock().unwrap().acct(&booster.id()) };
+
+        // A quest to boost (no bounty, so escrow doesn't muddy the balance).
+        let q = Quest::create(
+            &booster, "feature me", "spec",
+            vec![Task { id: "t0".into(), spec: "a".into(), verify: String::new() }],
+            vec![], 0, 0, 1,
+        );
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
+
+        // Boost it 30 credits: burned from the booster's balance, added to its score.
+        let b = Boost::create(&booster, &q.id, 30, 2);
+        assert_eq!(post_json(&dir, "/boost", serde_json::to_vec(&b).unwrap()).await, StatusCode::OK);
+        {
+            let d = dir.lock().unwrap();
+            assert_eq!(d.credits(now_secs())[&ba], FAUCET - 30, "boost burns credits");
+            assert_eq!(d.boost_score(&q.id), 30);
+        }
+
+        // A boost beyond the remaining balance is refused (402), balance unchanged.
+        let broke = Boost::create(&booster, &q.id, 10_000, 3);
+        assert_eq!(
+            post_json(&dir, "/boost", serde_json::to_vec(&broke).unwrap()).await,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        {
+            let d = dir.lock().unwrap();
+            assert_eq!(d.credits(now_secs())[&ba], FAUCET - 30, "refused boost didn't debit");
+            assert_eq!(d.boost_score(&q.id), 30);
+        }
     }
 
     #[tokio::test]
