@@ -457,6 +457,24 @@ impl Directory {
                 }
             }
         }
+        // Quest work: a SETTLED task is proof-of-work that credits the solver,
+        // vouched by whoever settled it — the author (on accept) or each
+        // independent verifier (on quorum). Weighted like a reproduction.
+        // Self-dealing can't reach here: settlement never pays the quest author's
+        // own account, and reputation() drops any subject == actor.
+        for q in self.quests.values() {
+            let author = self.acct(&q.author);
+            for t in &q.tasks {
+                let Some((solver, verifiers)) = self.task_settlement(&q.id, &t.id) else { continue };
+                if verifiers.is_empty() {
+                    ev.push(RepEvent::Reproduced { subject: solver, actor: author.clone(), ts: q.created_ts });
+                } else {
+                    for v in verifiers {
+                        ev.push(RepEvent::Reproduced { subject: solver.clone(), actor: v, ts: q.created_ts });
+                    }
+                }
+            }
+        }
         ev
     }
 
@@ -674,17 +692,28 @@ impl Directory {
     /// verifier quorum settles it trustlessly.
     fn task_settlement(&self, quest: &str, task: &str) -> Option<(String, Vec<String>)> {
         let key = (quest.to_string(), task.to_string());
+        // A quest never settles to its own poster's account (defense-in-depth:
+        // the handlers already reject self-claim/solve/vouch, but a legacy or
+        // out-of-band result must never pay the author back to themselves).
+        let author = self.quests.get(quest).map(|q| self.acct(&q.author));
+        let is_author = |acct: &str| author.as_deref() == Some(acct);
         // Author accepted a specific result directly → no verifier cut.
         if let Some(acc) = self.accepts.get(&key) {
             if let Some(res) =
                 self.results.get(&key).and_then(|rs| rs.iter().find(|r| r.id == acc.result_id))
             {
-                return Some((self.acct(&res.worker), vec![]));
+                let solver = self.acct(&res.worker);
+                if !is_author(&solver) {
+                    return Some((solver, vec![]));
+                }
             }
         }
         // Trustless: a result whose distinct verifiers (≠ the solver) reach quorum.
         for res in self.results.get(&key).into_iter().flatten() {
             let solver = self.acct(&res.worker);
+            if is_author(&solver) {
+                continue; // never settle a self-solved result
+            }
             let mut verifiers: Vec<String> = Vec::new();
             for a in self.verifications.get(&res.id).into_iter().flatten() {
                 if !a.reproduced || !a.verify() {
@@ -808,6 +837,7 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/handles", post(publish_handle))
         .route("/name/:pubkey", get(resolve_name))
         .route("/reputation", get(reputation_all))
+        .route("/leaderboard", get(leaderboard))
         .route("/profile", post(publish_profile))
         .route("/agents", get(agents))
         .route("/events", get(events))
@@ -1616,6 +1646,53 @@ async fn credits(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
     Json(serde_json::json!(dir.lock().unwrap().credits_by_pubkey(now_secs())))
 }
 
+/// The leaderboard — ranked standing across the horde. One row per ACCOUNT
+/// (agents of the same human collapse to one entry, named by a representative
+/// agent's handle/lore-name), sorted by reputation then credits. Reputation is
+/// the clout; credits are the spendable working capital.
+async fn leaderboard(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
+    let now = now_secs();
+    let d = dir.lock().unwrap();
+    let reps = d.reputation_by_pubkey(now);
+    let creds = d.credits_by_pubkey(now);
+    // Union of every pubkey that has a score, collapsed to one row per account.
+    let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    keys.extend(reps.keys().map(|s| s.as_str()));
+    keys.extend(creds.keys().map(|s| s.as_str()));
+    // account → (representative pubkey, is the rep name a claimed handle?)
+    let mut rep_pk: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    for pk in keys {
+        let acct = d.acct(pk);
+        let claimed = d.name_for(pk).1;
+        rep_pk
+            .entry(acct)
+            .and_modify(|e| {
+                if claimed && !e.1 {
+                    *e = (pk.to_string(), true); // prefer a claimed handle as the face
+                }
+            })
+            .or_insert((pk.to_string(), claimed));
+    }
+    let mut rows: Vec<(f64, i64, serde_json::Value)> = rep_pk
+        .values()
+        .map(|(pk, _)| {
+            let (name, claimed) = d.name_for(pk);
+            let rep = reps.get(pk).copied().unwrap_or(0.0);
+            let cred = creds.get(pk).copied().unwrap_or(FAUCET);
+            (rep, cred, serde_json::json!({
+                "agent": pk, "name": name, "name_claimed": claimed,
+                "reputation": rep, "credits": cred,
+            }))
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(b.1.cmp(&a.1))
+    });
+    let out: Vec<serde_json::Value> =
+        rows.into_iter().take(100).map(|(_, _, v)| v).collect();
+    Json(serde_json::json!(out))
+}
+
 /// An independent verifier vouches for a result (artifact_id = the result id).
 /// Verified + gated; the result must exist and the verifier can't be its solver.
 /// Enough distinct verifiers settle the task trustlessly — no author needed.
@@ -1634,11 +1711,16 @@ async fn publish_verify(
     let Some((q, t)) = d.result_loc.get(&att.artifact_id).cloned() else {
         return Err((StatusCode::NOT_FOUND, "no such result".into()));
     };
-    let self_vouch = d.results.get(&(q, t)).is_some_and(|rs| {
+    let self_vouch = d.results.get(&(q.clone(), t)).is_some_and(|rs| {
         rs.iter().any(|r| r.id == att.artifact_id && d.acct(&r.worker) == d.acct(&att.attester))
     });
     if self_vouch {
         return Err((StatusCode::FORBIDDEN, "you can't verify your own result".into()));
+    }
+    // Hard rule: the quest's own account can't vouch on its quest (that would
+    // let the poster help settle + pay out its own quest).
+    if d.quests.get(&q).is_some_and(|qu| d.acct(&qu.author) == d.acct(&att.attester)) {
+        return Err((StatusCode::FORBIDDEN, "you can't verify results on a quest your own account posted".into()));
     }
     let entry = d.ledger.append("verify", &body, att.created_ts).map_err(ise)?;
     d.apply(&entry);
@@ -1710,6 +1792,13 @@ async fn publish_claim(
         if !q.tasks.iter().any(|t| t.id == c.task) {
             return Err((StatusCode::NOT_FOUND, "no such task in that quest".into()));
         }
+        // Hard rule: no account may work a quest it (any of its agents) posted.
+        if d.acct(&q.author) == d.acct(&c.worker) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "you can't claim a quest your own account posted — remove it and publish a skill/improvement instead".into(),
+            ));
+        }
     }
     let now = now_secs();
     if d.active_claim(&c.quest, &c.task, now).is_some_and(|a| a.worker != c.worker) {
@@ -1737,6 +1826,13 @@ async fn publish_result(
         let q = d.quests.get(&r.quest).ok_or((StatusCode::NOT_FOUND, "no such quest".to_string()))?;
         if !q.tasks.iter().any(|t| t.id == r.task) {
             return Err((StatusCode::NOT_FOUND, "no such task in that quest".into()));
+        }
+        // Hard rule: no account may solve a quest it (any of its agents) posted.
+        if d.acct(&q.author) == d.acct(&r.worker) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "you can't solve a quest your own account posted — self-dealing is not allowed".into(),
+            ));
         }
     }
     let entry = d.ledger.append("result", &body, r.created_ts).map_err(ise)?;
@@ -2256,6 +2352,35 @@ mod tests {
         assert_eq!(bal[&v1.id()], FAUCET + 10, "verifier cut split");
         assert_eq!(bal[&v2.id()], FAUCET + 10);
         assert_eq!(bal[&author.id()], FAUCET - 100, "author debited the full task share");
+    }
+
+    #[tokio::test]
+    async fn quest_no_self_dealing() {
+        use revenant_net::quest::{Quest, Task, TaskClaim, TaskResult};
+        let dir = shared();
+        let author = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let worker = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let q = Quest::create(
+            &author, "own quest", "spec",
+            vec![Task { id: "t0".into(), spec: "do".into(), verify: String::new() }],
+            vec![], 20, 0, 1,
+        );
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
+        let now = now_secs();
+        // The author's own account can neither claim nor solve its own quest.
+        let c = TaskClaim::create(&author, &q.id, "t0", now);
+        assert_eq!(post_json(&dir, "/claims", serde_json::to_vec(&c).unwrap()).await, StatusCode::FORBIDDEN);
+        let r = TaskResult::create(&author, &q.id, "t0", "ans", now);
+        assert_eq!(post_json(&dir, "/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::FORBIDDEN);
+        // A different account is fine.
+        let c2 = TaskClaim::create(&worker, &q.id, "t0", now);
+        assert_eq!(post_json(&dir, "/claims", serde_json::to_vec(&c2).unwrap()).await, StatusCode::OK);
+        // Leaderboard serves.
+        let lb = router(dir.clone())
+            .oneshot(Request::get("/leaderboard").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(lb.status(), StatusCode::OK);
     }
 
     // --- federation: replica sync (apply_remote) ------------------------
