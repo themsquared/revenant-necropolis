@@ -1970,9 +1970,52 @@ async fn publish_close(
 
 #[derive(Deserialize)]
 struct HordeQuery {
-    /// The requesting agent's pubkey — scopes reads to its account's board.
-    agent: String,
     run: Option<String>,
+}
+
+/// Verify a signed read proof (x-rev-agent/-ts/-nonce/-sig over the request
+/// path) and return the VERIFIED reader pubkey. Private-board reads are scoped
+/// to the account of the key that signed — never to a caller-asserted pubkey.
+/// Nonces are single-use within the freshness window (replay guard).
+fn verify_read_proof(
+    headers: &axum::http::HeaderMap,
+    resource: &str,
+    nonces: &std::sync::Mutex<BTreeMap<String, i64>>,
+) -> Result<String, (StatusCode, String)> {
+    let hdr = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or((StatusCode::UNAUTHORIZED, format!("missing read-proof header {name}")))
+    };
+    let agent = hdr(revenant_net::a2a::HDR_AGENT)?;
+    let ts: i64 = hdr(revenant_net::a2a::HDR_TS)?.parse().unwrap_or(0);
+    let nonce = hdr(revenant_net::a2a::HDR_NONCE)?;
+    let sig = hdr(revenant_net::a2a::HDR_SIG)?;
+    let now = now_secs();
+    if (now - ts).abs() > revenant_net::proof::PROOF_FRESHNESS_SECS {
+        return Err((StatusCode::UNAUTHORIZED, "read proof timestamp outside freshness window".into()));
+    }
+    {
+        let mut seen = nonces.lock().unwrap();
+        seen.retain(|_, at| now - *at <= revenant_net::proof::PROOF_FRESHNESS_SECS);
+        if seen.contains_key(&nonce) {
+            return Err((StatusCode::UNAUTHORIZED, "replayed read-proof nonce".into()));
+        }
+        seen.insert(nonce.clone(), now);
+    }
+    if !revenant_net::proof::verify(&agent, resource, ts, &nonce, &sig) {
+        return Err((StatusCode::UNAUTHORIZED, "read proof signature verification failed".into()));
+    }
+    Ok(agent)
+}
+
+/// Single-use read-proof nonces (process-local; the directory is one instance).
+static READ_NONCES: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, i64>>> =
+    std::sync::OnceLock::new();
+fn read_nonces() -> &'static std::sync::Mutex<BTreeMap<String, i64>> {
+    READ_NONCES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 /// Post a subtask to the author's account board. Requires a verified account.
@@ -1993,14 +2036,18 @@ async fn publish_horde_task(
     Ok(Json(serde_json::json!({ "ok": true, "id": t.id, "run": t.run })))
 }
 
-/// Open tasks on the requesting agent's account board (a worker's poll).
+/// Open tasks on the READER's account board (a worker's poll). The reader is
+/// whoever signed the read proof — the board someone can see is exactly the
+/// board their key belongs to.
 async fn horde_tasks(
     State(dir): State<SharedDir>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HordeQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let reader = verify_read_proof(&headers, "/horde/tasks", read_nonces())?;
     let now = now_secs();
     let d = dir.lock().unwrap();
-    let acct = d.acct(&q.agent);
+    let acct = d.acct(&reader);
     let mut out: Vec<serde_json::Value> = d
         .horde_tasks
         .values()
@@ -2010,19 +2057,20 @@ async fn horde_tasks(
         .map(|t| d.horde_view(t, now))
         .collect();
     out.sort_by(|a, b| b["created_ts"].as_i64().cmp(&a["created_ts"].as_i64()));
-    Json(serde_json::json!(out))
+    Ok(Json(serde_json::json!(out)))
 }
 
 /// Full state of one run — every subtask with status + result — for the
-/// orchestrator to gather. Scoped to the requesting agent's account.
+/// orchestrator to gather. Signed read; scoped to the SIGNER's account.
 async fn horde_run(
     State(dir): State<SharedDir>,
     Path(run): Path<String>,
-    Query(q): Query<HordeQuery>,
-) -> Json<serde_json::Value> {
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let reader = verify_read_proof(&headers, &format!("/horde/runs/{run}"), read_nonces())?;
     let now = now_secs();
     let d = dir.lock().unwrap();
-    let acct = d.acct(&q.agent);
+    let acct = d.acct(&reader);
     let mut tasks: Vec<serde_json::Value> = d
         .horde_tasks
         .values()
@@ -2031,11 +2079,11 @@ async fn horde_run(
         .collect();
     tasks.sort_by(|a, b| a["created_ts"].as_i64().cmp(&b["created_ts"].as_i64()));
     let done = tasks.iter().filter(|t| t["status"] == "solved").count();
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "run": run, "total": tasks.len(), "solved": done,
         "complete": !tasks.is_empty() && done == tasks.len(),
         "tasks": tasks,
-    }))
+    })))
 }
 
 /// Claim a horde task under a lease. Same-account only; 409 if another of the
@@ -2874,10 +2922,20 @@ mod tests {
         let t = HordeTask::create(&orch, "run-1", "sub A", "do A", vec![], 1);
         assert_eq!(post_json(&dir, "/horde/tasks", serde_json::to_vec(&t).unwrap()).await, StatusCode::OK);
 
-        // Same-account worker sees it; a stranger's board is empty.
-        let mine = get_json(&dir, &format!("/horde/tasks?agent={}", worker.id())).await;
+        // An unsigned read is refused outright — no proof, no board.
+        {
+            let resp = router(dir.clone())
+                .oneshot(Request::get("/horde/tasks").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "board reads require a signed proof");
+        }
+        // The signed reader sees exactly their own account's board: the worker
+        // (same account) sees the task; a stranger's signed read shows only the
+        // stranger's own (empty) board — never someone else's.
+        let mine = get_json_signed(&dir, "/horde/tasks", "/horde/tasks", &worker, "n-worker").await;
         assert_eq!(mine.as_array().unwrap().len(), 1, "same-account worker sees the task");
-        let theirs = get_json(&dir, &format!("/horde/tasks?agent={}", stranger.id())).await;
+        let theirs = get_json_signed(&dir, "/horde/tasks", "/horde/tasks", &stranger, "n-stranger").await;
         assert_eq!(theirs.as_array().unwrap().len(), 0, "a stranger can't see the account's board");
 
         // A stranger can't claim it.
@@ -2893,8 +2951,8 @@ mod tests {
         let r = HordeResult::create(&worker, &t.id, "answer A", 3);
         assert_eq!(post_json(&dir, "/horde/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
 
-        // The run is complete and the orchestrator gathers the output.
-        let run = get_json(&dir, &format!("/horde/runs/run-1?agent={}", orch.id())).await;
+        // The run is complete and the orchestrator gathers the output (signed).
+        let run = get_json_signed(&dir, "/horde/runs/run-1", "/horde/runs/run-1", &orch, "n-orch").await;
         assert_eq!(run["complete"], serde_json::json!(true));
         assert_eq!(run["tasks"][0]["status"], serde_json::json!("solved"));
         assert_eq!(run["tasks"][0]["output"], serde_json::json!("answer A"));
@@ -3107,6 +3165,33 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    /// GET with a signed read proof over `resource` (the path sans query) —
+    /// how workers/orchestrators read the private board.
+    async fn get_json_signed(
+        dir: &SharedDir,
+        path: &str,
+        resource: &str,
+        id: &Identity,
+        nonce: &str,
+    ) -> serde_json::Value {
+        let ts = now_secs();
+        let sig = revenant_net::proof::sign(id, resource, ts, nonce);
+        let resp = router(dir.clone())
+            .oneshot(
+                Request::get(path)
+                    .header(revenant_net::a2a::HDR_AGENT, id.id())
+                    .header(revenant_net::a2a::HDR_TS, ts.to_string())
+                    .header(revenant_net::a2a::HDR_NONCE, nonce)
+                    .header(revenant_net::a2a::HDR_SIG, sig)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     async fn get_json(dir: &SharedDir, path: &str) -> serde_json::Value {
