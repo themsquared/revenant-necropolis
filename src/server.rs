@@ -12,6 +12,7 @@ use revenant_net::boost::Boost;
 use revenant_net::handle::{self, Handle};
 use revenant_net::ledger::{Entry, Ledger};
 use revenant_net::profile::AgentProfile;
+use revenant_net::horde::{HordeClaim, HordeResult, HordeTask};
 use revenant_net::quest::{Quest, QuestClose, TaskAccept, TaskClaim, TaskResult};
 use revenant_net::reply::Reply;
 use revenant_net::reputation::{reputation, RepEvent, RepParams};
@@ -124,6 +125,11 @@ pub struct Directory {
     /// Quests the author has closed out: quest id → earliest close timestamp. A
     /// closed quest leaves the board and stops escrowing its unsettled tasks.
     closed: BTreeMap<String, i64>,
+    /// The private horde board — account-scoped coordination, no economy. Tasks
+    /// by id; claims + results keyed by task id.
+    horde_tasks: BTreeMap<String, HordeTask>,
+    horde_claims: BTreeMap<String, Vec<HordeClaim>>,
+    horde_results: BTreeMap<String, Vec<HordeResult>>,
     /// When true, publishing requires the author to be bound to a verified
     /// human account. Reads are always open. Default true (env can disable).
     require_account: bool,
@@ -159,6 +165,9 @@ impl Directory {
             result_loc: BTreeMap::new(),
             boosts: Vec::new(),
             closed: BTreeMap::new(),
+            horde_tasks: BTreeMap::new(),
+            horde_claims: BTreeMap::new(),
+            horde_results: BTreeMap::new(),
             require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
         };
         for e in dir.ledger.since(0)? {
@@ -326,6 +335,42 @@ impl Directory {
                     // Dedup by signature so a replayed entry isn't double-counted.
                     if b.verify() && !self.boosts.iter().any(|x| x.sig == b.sig) {
                         self.boosts.push(b);
+                    }
+                }
+            }
+            "horde_task" => {
+                if let Ok(t) = serde_json::from_str::<HordeTask>(&e.body) {
+                    if t.verify() {
+                        self.horde_tasks.entry(t.id.clone()).or_insert(t);
+                    }
+                }
+            }
+            "horde_claim" => {
+                if let Ok(c) = serde_json::from_str::<HordeClaim>(&e.body) {
+                    // Same-account gate: only an agent of the task's account may claim.
+                    let same = self
+                        .horde_tasks
+                        .get(&c.task)
+                        .is_some_and(|t| self.acct(&t.author) == self.acct(&c.worker));
+                    if c.verify() && same {
+                        let list = self.horde_claims.entry(c.task.clone()).or_default();
+                        if !list.iter().any(|x| x.id == c.id) {
+                            list.push(c);
+                        }
+                    }
+                }
+            }
+            "horde_result" => {
+                if let Ok(r) = serde_json::from_str::<HordeResult>(&e.body) {
+                    let same = self
+                        .horde_tasks
+                        .get(&r.task)
+                        .is_some_and(|t| self.acct(&t.author) == self.acct(&r.worker));
+                    if r.verify() && same {
+                        let list = self.horde_results.entry(r.task.clone()).or_default();
+                        if !list.iter().any(|x| x.id == r.id) {
+                            list.push(r);
+                        }
                     }
                 }
             }
@@ -656,6 +701,42 @@ impl Directory {
             .max_by_key(|c| c.created_ts)
     }
 
+    /// The worker holding a horde task's lease, if any (moot once a result exists).
+    fn active_horde_claim(&self, task: &str, now: i64) -> Option<&HordeClaim> {
+        if self.horde_results.get(task).is_some_and(|r| !r.is_empty()) {
+            return None;
+        }
+        self.horde_claims
+            .get(task)?
+            .iter()
+            .filter(|c| now - c.created_ts < CLAIM_LEASE_SECS)
+            .max_by_key(|c| c.created_ts)
+    }
+
+    /// A horde task's lifecycle: solved (has a result) > claimed (live lease) > open.
+    fn horde_status(&self, task: &str, now: i64) -> &'static str {
+        if self.horde_results.get(task).is_some_and(|r| !r.is_empty()) {
+            "solved"
+        } else if self.active_horde_claim(task, now).is_some() {
+            "claimed"
+        } else {
+            "open"
+        }
+    }
+
+    /// One task's public shape for the board (status, claimant, result output).
+    fn horde_view(&self, t: &HordeTask, now: i64) -> serde_json::Value {
+        let result = self.horde_results.get(&t.id).and_then(|r| r.last());
+        serde_json::json!({
+            "id": t.id, "run": t.run, "title": t.title, "spec": t.spec, "sigils": t.sigils,
+            "author": t.author, "created_ts": t.created_ts,
+            "status": self.horde_status(&t.id, now),
+            "claimant": self.active_horde_claim(&t.id, now).map(|c| c.worker.clone()),
+            "worker": result.map(|r| r.worker.clone()),
+            "output": result.map(|r| r.output.clone()),
+        })
+    }
+
     /// Count of a quest's tasks that are genuinely available: not settled, no
     /// result awaiting acceptance, and no live lease.
     fn open_task_count(&self, q: &Quest, now: i64) -> usize {
@@ -910,6 +991,11 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/close", post(publish_close))
         .route("/verify", post(publish_verify))
         .route("/boost", post(publish_boost))
+        // The private horde board — account-scoped coordination.
+        .route("/horde/tasks", post(publish_horde_task).get(horde_tasks))
+        .route("/horde/runs/:run", get(horde_run))
+        .route("/horde/claim", post(publish_horde_claim))
+        .route("/horde/results", post(publish_horde_result))
         .route("/credits", get(credits))
         .route("/search", get(search))
         .route("/sigils", get(sigils))
@@ -1875,6 +1961,126 @@ async fn publish_close(
     })))
 }
 
+// ---- the private horde board (account-scoped coordination, no economy) ----
+
+#[derive(Deserialize)]
+struct HordeQuery {
+    /// The requesting agent's pubkey — scopes reads to its account's board.
+    agent: String,
+    run: Option<String>,
+}
+
+/// Post a subtask to the author's account board. Requires a verified account.
+async fn publish_horde_task(
+    State(dir): State<SharedDir>,
+    Json(t): Json<HordeTask>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !t.verify() {
+        return Err((StatusCode::BAD_REQUEST, "horde task failed signature/hash verification".into()));
+    }
+    let body = serde_json::to_string(&t).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    if d.require_account && !d.accounts.is_authorized(&t.author) {
+        return Err((StatusCode::FORBIDDEN, "posting horde work requires a verified human account".into()));
+    }
+    let entry = d.ledger.append("horde_task", &body, t.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "id": t.id, "run": t.run })))
+}
+
+/// Open tasks on the requesting agent's account board (a worker's poll).
+async fn horde_tasks(
+    State(dir): State<SharedDir>,
+    Query(q): Query<HordeQuery>,
+) -> Json<serde_json::Value> {
+    let now = now_secs();
+    let d = dir.lock().unwrap();
+    let acct = d.acct(&q.agent);
+    let mut out: Vec<serde_json::Value> = d
+        .horde_tasks
+        .values()
+        .filter(|t| d.acct(&t.author) == acct)
+        .filter(|t| q.run.as_ref().is_none_or(|r| &t.run == r))
+        .filter(|t| d.horde_status(&t.id, now) == "open")
+        .map(|t| d.horde_view(t, now))
+        .collect();
+    out.sort_by(|a, b| b["created_ts"].as_i64().cmp(&a["created_ts"].as_i64()));
+    Json(serde_json::json!(out))
+}
+
+/// Full state of one run — every subtask with status + result — for the
+/// orchestrator to gather. Scoped to the requesting agent's account.
+async fn horde_run(
+    State(dir): State<SharedDir>,
+    Path(run): Path<String>,
+    Query(q): Query<HordeQuery>,
+) -> Json<serde_json::Value> {
+    let now = now_secs();
+    let d = dir.lock().unwrap();
+    let acct = d.acct(&q.agent);
+    let mut tasks: Vec<serde_json::Value> = d
+        .horde_tasks
+        .values()
+        .filter(|t| t.run == run && d.acct(&t.author) == acct)
+        .map(|t| d.horde_view(t, now))
+        .collect();
+    tasks.sort_by(|a, b| a["created_ts"].as_i64().cmp(&b["created_ts"].as_i64()));
+    let done = tasks.iter().filter(|t| t["status"] == "solved").count();
+    Json(serde_json::json!({
+        "run": run, "total": tasks.len(), "solved": done,
+        "complete": !tasks.is_empty() && done == tasks.len(),
+        "tasks": tasks,
+    }))
+}
+
+/// Claim a horde task under a lease. Same-account only; 409 if another of the
+/// account's agents holds a live lease.
+async fn publish_horde_claim(
+    State(dir): State<SharedDir>,
+    Json(c): Json<HordeClaim>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !c.verify() {
+        return Err((StatusCode::BAD_REQUEST, "horde claim failed signature verification".into()));
+    }
+    let body = serde_json::to_string(&c).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    let Some(task) = d.horde_tasks.get(&c.task).cloned() else {
+        return Err((StatusCode::NOT_FOUND, "no such horde task".into()));
+    };
+    if d.acct(&task.author) != d.acct(&c.worker) {
+        return Err((StatusCode::FORBIDDEN, "only agents of the task's account may claim it".into()));
+    }
+    if let Some(live) = d.active_horde_claim(&c.task, now_secs()) {
+        if live.worker != c.worker {
+            return Err((StatusCode::CONFLICT, "another of your agents is already on this task".into()));
+        }
+    }
+    let entry = d.ledger.append("horde_claim", &body, c.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "task": c.task })))
+}
+
+/// Submit a result for a horde task. Same-account only.
+async fn publish_horde_result(
+    State(dir): State<SharedDir>,
+    Json(r): Json<HordeResult>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !r.verify() {
+        return Err((StatusCode::BAD_REQUEST, "horde result failed signature verification".into()));
+    }
+    let body = serde_json::to_string(&r).map_err(ise)?;
+    let mut d = dir.lock().unwrap();
+    let Some(task) = d.horde_tasks.get(&r.task).cloned() else {
+        return Err((StatusCode::NOT_FOUND, "no such horde task".into()));
+    };
+    if d.acct(&task.author) != d.acct(&r.worker) {
+        return Err((StatusCode::FORBIDDEN, "only agents of the task's account may submit results".into()));
+    }
+    let entry = d.ledger.append("horde_result", &body, r.created_ts).map_err(ise)?;
+    d.apply(&entry);
+    Ok(Json(serde_json::json!({ "ok": true, "task": r.task, "result_id": r.id })))
+}
+
 #[derive(Deserialize)]
 struct QuestsQuery {
     sigil: Option<String>,
@@ -2641,6 +2847,53 @@ mod tests {
             serde_json::json!("withdrawn"),
             "closing an unsolved quest is a withdrawal — proof can't be asserted"
         );
+    }
+
+    #[tokio::test]
+    async fn horde_board_is_account_private_and_gathers_a_run() {
+        use revenant_net::horde::{HordeClaim, HordeResult, HordeTask};
+        let dir = shared();
+        let mk = || Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (orch, worker, stranger) = (mk(), mk(), mk());
+        // orch + worker are two agents of ONE account; stranger is separate.
+        {
+            let d = dir.lock().unwrap();
+            let reg = d.accounts.register("horde@x.com").unwrap();
+            d.accounts.verify(&reg.verify_token).unwrap();
+            for g in [&orch, &worker] {
+                let sig = g.sign_hex(reg.account_key.as_bytes());
+                d.accounts.bind(&reg.account_key, &g.id(), &sig).unwrap();
+            }
+        }
+        // Orchestrator posts a subtask under run-1.
+        let t = HordeTask::create(&orch, "run-1", "sub A", "do A", vec![], 1);
+        assert_eq!(post_json(&dir, "/horde/tasks", serde_json::to_vec(&t).unwrap()).await, StatusCode::OK);
+
+        // Same-account worker sees it; a stranger's board is empty.
+        let mine = get_json(&dir, &format!("/horde/tasks?agent={}", worker.id())).await;
+        assert_eq!(mine.as_array().unwrap().len(), 1, "same-account worker sees the task");
+        let theirs = get_json(&dir, &format!("/horde/tasks?agent={}", stranger.id())).await;
+        assert_eq!(theirs.as_array().unwrap().len(), 0, "a stranger can't see the account's board");
+
+        // A stranger can't claim it.
+        let sc = HordeClaim::create(&stranger, &t.id, 2);
+        assert_eq!(
+            post_json(&dir, "/horde/claim", serde_json::to_vec(&sc).unwrap()).await,
+            StatusCode::FORBIDDEN
+        );
+
+        // Worker claims + submits.
+        let c = HordeClaim::create(&worker, &t.id, 2);
+        assert_eq!(post_json(&dir, "/horde/claim", serde_json::to_vec(&c).unwrap()).await, StatusCode::OK);
+        let r = HordeResult::create(&worker, &t.id, "answer A", 3);
+        assert_eq!(post_json(&dir, "/horde/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
+
+        // The run is complete and the orchestrator gathers the output.
+        let run = get_json(&dir, &format!("/horde/runs/run-1?agent={}", orch.id())).await;
+        assert_eq!(run["complete"], serde_json::json!(true));
+        assert_eq!(run["tasks"][0]["status"], serde_json::json!("solved"));
+        assert_eq!(run["tasks"][0]["output"], serde_json::json!("answer A"));
+        assert_eq!(run["tasks"][0]["worker"], serde_json::json!(worker.id()));
     }
 
     #[tokio::test]
