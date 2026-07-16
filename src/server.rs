@@ -698,13 +698,19 @@ impl Directory {
             })
             .collect();
         let (name, _) = self.name_for(&q.author);
-        // Quest-level lifecycle: closed (author retired it) > complete (every task
-        // settled) > open (work remains).
+        // Quest-level lifecycle. Completion is DERIVED from settlement facts on
+        // the ledger, never asserted by the closer: a close is just "retire," and
+        // its meaning depends on whether the work was actually proven —
+        //   completed  = closed AND every task settled (accepted / quorum-verified)
+        //   withdrawn  = closed with ≥1 task never settled (unsolved work abandoned)
+        //   complete   = all tasks settled, ready to close
+        //   open       = work remains
         let closed_ts = self.closed.get(quest).copied();
-        let all_settled = q.tasks.iter().all(|t| self.task_settlement(quest, &t.id).is_some());
+        let all_settled =
+            !q.tasks.is_empty() && q.tasks.iter().all(|t| self.task_settlement(quest, &t.id).is_some());
         let status = if closed_ts.is_some() {
-            "closed"
-        } else if !q.tasks.is_empty() && all_settled {
+            if all_settled { "completed" } else { "withdrawn" }
+        } else if all_settled {
             "complete"
         } else {
             "open"
@@ -1849,15 +1855,23 @@ async fn publish_close(
     if d.closed.contains_key(&c.quest) {
         return Ok(Json(serde_json::json!({ "ok": true, "quest": c.quest, "status": "already closed" })));
     }
-    let refunded_before = d.credits(now_secs());
+    // The truthful outcome is derived from settlement facts, not the closer's
+    // intent: an unsettled task means the quest is being WITHDRAWN, not completed.
+    let (unsettled, completed) = {
+        let q = d.quests.get(&c.quest).unwrap(); // existence checked above
+        let uns = q.tasks.iter().filter(|t| d.task_settlement(&c.quest, &t.id).is_none()).count();
+        (uns, !q.tasks.is_empty() && uns == 0)
+    };
     let acct = d.acct(&c.author);
-    let before = refunded_before.get(&acct).copied().unwrap_or(FAUCET);
+    let before = d.credits(now_secs()).get(&acct).copied().unwrap_or(FAUCET);
     let entry = d.ledger.append("close", &body, c.created_ts).map_err(ise)?;
     d.apply(&entry);
     let after = d.credits(now_secs()).get(&acct).copied().unwrap_or(FAUCET);
     let refunded = (after - before).max(0);
     Ok(Json(serde_json::json!({
-        "ok": true, "quest": c.quest, "status": "closed", "refunded": refunded,
+        "ok": true, "quest": c.quest,
+        "outcome": if completed { "completed" } else { "withdrawn" },
+        "unsettled_tasks": unsettled, "refunded": refunded,
     })))
 }
 
@@ -2575,7 +2589,8 @@ mod tests {
         {
             let d = dir.lock().unwrap();
             assert_eq!(d.credits(now_secs())[&aa], FAUCET - 20, "unsettled escrow refunded on close");
-            assert_eq!(d.quest_state(&q.id, now_secs()).unwrap()["status"], serde_json::json!("closed"));
+            // t1 never settled → this close is a WITHDRAWAL, not a completion.
+            assert_eq!(d.quest_state(&q.id, now_secs()).unwrap()["status"], serde_json::json!("withdrawn"));
             assert!(d.closed.contains_key(&q.id));
         }
         // And it's gone from the board.
@@ -2583,6 +2598,48 @@ mod tests {
         assert!(
             board.as_array().unwrap().iter().all(|x| x["id"] != serde_json::json!(q.id)),
             "closed quest must leave the board"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_outcome_is_completed_only_when_every_task_settled() {
+        use revenant_net::quest::{Quest, QuestClose, Task, TaskAccept, TaskResult};
+        let dir = shared();
+        let mk = || Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (author, worker) = (mk(), mk());
+
+        // Single-task quest, actually solved and accepted → closing = completed.
+        let q = Quest::create(
+            &author, "prove it", "spec",
+            vec![Task { id: "t0".into(), spec: "do".into(), verify: String::new() }],
+            vec![], 0, 0, 1,
+        );
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q).unwrap()).await, StatusCode::OK);
+        let r = TaskResult::create(&worker, &q.id, "t0", "answer", 2);
+        assert_eq!(post_json(&dir, "/results", serde_json::to_vec(&r).unwrap()).await, StatusCode::OK);
+        let acc = TaskAccept::create(&author, &q.id, "t0", &r.id, 3);
+        assert_eq!(post_json(&dir, "/accept", serde_json::to_vec(&acc).unwrap()).await, StatusCode::OK);
+        let close = QuestClose::create(&author, &q.id, 4);
+        assert_eq!(post_json(&dir, "/close", serde_json::to_vec(&close).unwrap()).await, StatusCode::OK);
+        assert_eq!(
+            dir.lock().unwrap().quest_state(&q.id, now_secs()).unwrap()["status"],
+            serde_json::json!("completed"),
+            "a close is 'completed' only when the task was actually settled"
+        );
+
+        // Second quest, never solved → closing = withdrawn, not completed.
+        let q2 = Quest::create(
+            &author, "never done", "spec",
+            vec![Task { id: "t0".into(), spec: "do".into(), verify: String::new() }],
+            vec![], 0, 0, 5,
+        );
+        assert_eq!(post_json(&dir, "/quests", serde_json::to_vec(&q2).unwrap()).await, StatusCode::OK);
+        let close2 = QuestClose::create(&author, &q2.id, 6);
+        assert_eq!(post_json(&dir, "/close", serde_json::to_vec(&close2).unwrap()).await, StatusCode::OK);
+        assert_eq!(
+            dir.lock().unwrap().quest_state(&q2.id, now_secs()).unwrap()["status"],
+            serde_json::json!("withdrawn"),
+            "closing an unsolved quest is a withdrawal — proof can't be asserted"
         );
     }
 
