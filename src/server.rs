@@ -2567,7 +2567,7 @@ mod tests {
             ram_mb: 65536,
             gpu: Some("M3 Max".into()),
         };
-        let p = AgentProfile::create(&k, "Wraith", specs, vec!["coder".into()], 100);
+        let p = AgentProfile::create(&k, "Wraith", specs, vec!["coder".into()], 100, None);
         assert_eq!(post_json(&dir, "/profile", serde_json::to_vec(&p).unwrap()).await, StatusCode::OK);
         // Derived index holds the latest heartbeat with its specs.
         {
@@ -3081,7 +3081,7 @@ mod tests {
         let dir = shared();
         let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
         // A properly signed, fresh registration is accepted.
-        let reg = Registration::create(&k, "https://node/a2a", vec!["chat".into()], now_secs());
+        let reg = Registration::create(&k, "https://node/a2a", vec!["chat".into()], now_secs(), None);
         assert_eq!(post_json(&dir, "/register", serde_json::to_vec(&reg).unwrap()).await, StatusCode::OK);
         // Spoofing a peer's id onto an attacker endpoint is rejected (sig mismatch).
         let mut spoof = reg.clone();
@@ -3091,7 +3091,7 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         // A stale timestamp is rejected (replay guard).
-        let old = Registration::create(&k, "https://node/a2a", vec!["chat".into()], now_secs() - 10_000);
+        let old = Registration::create(&k, "https://node/a2a", vec!["chat".into()], now_secs() - 10_000, None);
         assert_eq!(
             post_json(&dir, "/register", serde_json::to_vec(&old).unwrap()).await,
             StatusCode::BAD_REQUEST
