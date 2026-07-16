@@ -14,6 +14,7 @@ use revenant_net::ledger::{Entry, Ledger};
 use revenant_net::profile::AgentProfile;
 use revenant_net::horde::{HordeClaim, HordeResult, HordeTask};
 use revenant_net::quest::{Quest, QuestClose, TaskAccept, TaskClaim, TaskResult};
+use revenant_net::register::Registration;
 use revenant_net::reply::Reply;
 use revenant_net::reputation::{reputation, RepEvent, RepParams};
 use revenant_net::scroll::Scroll;
@@ -1041,20 +1042,24 @@ async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> axum
     resp
 }
 
-#[derive(Deserialize)]
-struct RegisterReq {
-    id: String,
-    endpoint: String,
-    #[serde(default)]
-    capabilities: Vec<String>,
-}
+/// How far a registration's timestamp may drift from the server's clock before
+/// it's rejected as stale/replayed.
+const REGISTER_FRESHNESS_SECS: i64 = 300;
 
 async fn register(
     State(dir): State<SharedDir>,
-    Json(req): Json<RegisterReq>,
+    Json(req): Json<Registration>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if req.id.len() != 64 || hex::decode(&req.id).is_err() {
         return Err((StatusCode::BAD_REQUEST, "id must be a 64-hex public key".into()));
+    }
+    // The registration must be signed by the key it advertises (no spoofing a
+    // peer's identity onto an endpoint you control) and reasonably fresh.
+    if !req.verify() {
+        return Err((StatusCode::FORBIDDEN, "registration signature does not match the advertised id".into()));
+    }
+    if (now_secs() - req.ts).abs() > REGISTER_FRESHNESS_SECS {
+        return Err((StatusCode::BAD_REQUEST, "registration timestamp is stale — re-sign with a current clock".into()));
     }
     let mut d = dir.lock().unwrap();
     // Presence (endpoint/capabilities) is ephemeral, not ledgered; reputation
@@ -3011,6 +3016,28 @@ mod tests {
         // Pre-validation means the *first*, valid entry was not applied either.
         assert_eq!(replica.artifacts.len(), 0, "a tampered batch is rejected whole");
         assert_eq!(replica.ledger.head_seq().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_requires_a_valid_signature() {
+        let dir = shared();
+        let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        // A properly signed, fresh registration is accepted.
+        let reg = Registration::create(&k, "https://node/a2a", vec!["chat".into()], now_secs());
+        assert_eq!(post_json(&dir, "/register", serde_json::to_vec(&reg).unwrap()).await, StatusCode::OK);
+        // Spoofing a peer's id onto an attacker endpoint is rejected (sig mismatch).
+        let mut spoof = reg.clone();
+        spoof.endpoint = "https://attacker/a2a".into();
+        assert_eq!(
+            post_json(&dir, "/register", serde_json::to_vec(&spoof).unwrap()).await,
+            StatusCode::FORBIDDEN
+        );
+        // A stale timestamp is rejected (replay guard).
+        let old = Registration::create(&k, "https://node/a2a", vec!["chat".into()], now_secs() - 10_000);
+        assert_eq!(
+            post_json(&dir, "/register", serde_json::to_vec(&old).unwrap()).await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
