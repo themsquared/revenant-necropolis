@@ -1673,6 +1673,9 @@ async fn agents(State(dir): State<SharedDir>) -> Json<serde_json::Value> {
                 "capabilities": p.capabilities,
                 "last_seen": p.created_ts,
                 "reputation": reps.get(&p.agent).copied().unwrap_or(0.0),
+                // The identity-signed TLS pin (SEC-4): peers verify a TLS
+                // session's cert fingerprint against this claim.
+                "tls_fp": p.tls_fp,
             })
         })
         .collect();
