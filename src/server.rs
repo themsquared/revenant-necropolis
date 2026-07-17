@@ -2006,6 +2006,11 @@ fn verify_read_proof(
         if seen.contains_key(&nonce) {
             return Err((StatusCode::UNAUTHORIZED, "replayed read-proof nonce".into()));
         }
+        // A nonce flood must not grow memory unboundedly — and dropping the
+        // guard would re-open replays, so FAIL CLOSED at capacity.
+        if seen.len() >= 65_536 {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "read volume exceeds capacity — retry shortly".into()));
+        }
         seen.insert(nonce.clone(), now);
     }
     if !revenant_net::proof::verify(&agent, resource, ts, &nonce, &sig) {
